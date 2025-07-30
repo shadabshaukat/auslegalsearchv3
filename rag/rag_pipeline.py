@@ -83,8 +83,9 @@ class RAGPipeline:
 
     def query(
         self, question: str, top_k: int = 5, context_chunks=None, sources=None, chunk_metadata=None, custom_prompt=None,
-        temperature=0.2, top_p=0.95, max_tokens=1024, repeat_penalty=1.1
+        temperature=0.2, top_p=0.95, max_tokens=1024, repeat_penalty=1.1, chat_history=None
     ) -> dict:
+        # Optionally receive chat_history; for now do not use it in the prompt, but unblocks conversational calls from backend.
         if context_chunks is not None:
             contexts = context_chunks
             metas = chunk_metadata if chunk_metadata is not None else [None for _ in contexts]
