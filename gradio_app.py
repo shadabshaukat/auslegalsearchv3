@@ -1,6 +1,6 @@
-"""
+""" 
 AUSLegalSearchv3 Gradio UI:
-- Tabs for Hybrid Search, Vector Search, RAG (with supersystem prompt), and Conversational Chat with Top K, source cards, and modern chat interface.
+- Tabs for Hybrid Search, Vector Search, RAG (with supersystem prompt), Conversational Chat, and Agentic Chat (chain-of-thought for both Ollama and OCI GenAI).
 """
 
 import gradio as gr
@@ -8,6 +8,7 @@ import requests
 import os
 import html
 import json
+import re
 
 API_ROOT = os.environ.get("AUSLEGALSEARCH_API_URL", "http://localhost:8000")
 SESS = type("Session", (), {"user": None, "auth": None})()
@@ -57,7 +58,6 @@ def fetch_ollama_models():
 def format_context_cards(sources, chunk_metadata, context_chunks):
     if not sources and not context_chunks:
         return ""
-    # Render a stylish source card for each
     cards = []
     for idx in range(max(len(sources), len(context_chunks))):
         meta = (chunk_metadata[idx] if idx < len(chunk_metadata) else {}) or {}
@@ -103,7 +103,6 @@ def vector_search_fn(query, top_k):
 def rag_chatbot(question, llm_source, ollama_model, oci_model_info_json, rag_top_k, system_prompt, temperature, top_p, max_tokens, repeat_penalty):
     if not question:
         return "", "", ""
-    # Step 1: Hybrid search
     try:
         resp = requests.post(
             f"{API_ROOT}/search/hybrid",
@@ -205,9 +204,7 @@ def conversational_chat_fn(message, llm_source, ollama_model, oci_model_info_jso
         chunk_metadata = data.get("chunk_metadata", [])
         context_chunks = data.get("context_chunks", [])
 
-        # ADD: Extract proper text for OCI GenAI if answer is a full JSON (chat_response)
         def extract_oci_text(ans):
-            # Handle dict
             if isinstance(ans, dict) and "chat_response" in ans:
                 try:
                     choices = ans["chat_response"].get("choices", [])
@@ -217,7 +214,6 @@ def conversational_chat_fn(message, llm_source, ollama_model, oci_model_info_jso
                             return content_list[0].get("text", "")
                 except Exception:
                     return str(ans)
-            # Sometimes backend may json.dumps() the answer:
             if isinstance(ans, str):
                 try:
                     asdict = json.loads(ans)
@@ -225,8 +221,6 @@ def conversational_chat_fn(message, llm_source, ollama_model, oci_model_info_jso
                 except Exception:
                     return ans
             return str(ans)
-
-        # If answer looks like OCI GenAI "Assistant: { ... }", extract inner
         if isinstance(answer, dict) or (isinstance(answer, str) and answer.strip().startswith("{")):
             try:
                 answer_text = extract_oci_text(answer)
@@ -234,7 +228,6 @@ def conversational_chat_fn(message, llm_source, ollama_model, oci_model_info_jso
                 answer_text = str(answer)
         else:
             answer_text = answer
-
         formatted_answer = html.escape(answer_text).replace("\\n", "<br>").replace("\n", "<br>")
     except Exception as e:
         formatted_answer = f"Error querying chatbot API: {e}"
@@ -243,14 +236,12 @@ def conversational_chat_fn(message, llm_source, ollama_model, oci_model_info_jso
         context_chunks = []
     if not isinstance(chat_history, list):
         chat_history = []
-    # Append user and assistant+cards to history, with separate cards entry
     chat_history.append({"role": "user", "content": message})
     chat_history.append({
         "role": "assistant",
         "content": formatted_answer,
         "cards": format_context_cards(sources, chunk_metadata, context_chunks)
     })
-    # Render as modern chat bubbles with context cards in a separate grid below answer
     def render_history(hist):
         html_out = "<div class='chatbox-ct'>"
         idx = 0
@@ -259,13 +250,110 @@ def conversational_chat_fn(message, llm_source, ollama_model, oci_model_info_jso
             if msg["role"] == "user":
                 html_out += f"<div class='bubble user-bubble'><b>User:</b> {msg['content']}</div>"
             elif msg["role"] == "assistant":
-                # Always show just the answer in the bubble, and the context cards right below it as grid
                 html_out += (
                     "<div class='bubble assistant-bubble'><b>Assistant:</b> "
                     f"{msg['content']}</div>"
                 )
                 if msg.get("cards"):
                     html_out += f"<div>{msg['cards']}</div>"
+            idx += 1
+        html_out += "</div>"
+        return html_out or "<i>No conversation yet.</i>"
+    return render_history(chat_history), chat_history
+
+def parse_agentic_markdown_to_steps(md_answer):
+    steps = []
+    pattern = re.compile(r"(Step\s+\d+\s*-\s*[^\n:]+:\s*.*?)(?=Step\s+\d+\s*-\s*[^\n:]+:|Final\s+Conclusion:|$)", re.DOTALL|re.IGNORECASE)
+    matches = pattern.findall(md_answer)
+    for step_block in matches:
+        m = re.match(r"Step\s+(\d+)\s*-\s*([^\n:]+):\s*(.+)", step_block, re.DOTALL|re.IGNORECASE)
+        if m:
+            step_num, label, content = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+            steps.append((f"Step {step_num} - {label}", label, content))
+    concl = re.search(r"Final\s*Conclusion:\s*(.+)", md_answer, re.DOTALL|re.IGNORECASE)
+    if concl:
+        steps.append(("Final Conclusion", "Conclusion", concl.group(1).strip()))
+    return steps
+
+def agentic_chat_fn(message, llm_source, ollama_model, oci_model_info_json, top_k, history, system_prompt, temperature, top_p, max_tokens, repeat_penalty):
+    chat_history = history or []
+    req = {
+        "llm_source": "ollama" if llm_source == "Local Ollama" else "oci_genai",
+        "model": ollama_model,
+        "message": message,
+        "chat_history": chat_history,
+        "system_prompt": system_prompt,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "repeat_penalty": repeat_penalty,
+        "top_k": top_k,
+        "oci_config": {},
+    }
+    if llm_source == "OCI GenAI":
+        try:
+            model_info = json.loads(oci_model_info_json) if oci_model_info_json else {}
+        except Exception:
+            model_info = {}
+        req["oci_config"] = {
+            "compartment_id": os.environ.get("OCI_COMPARTMENT_OCID", ""),
+            "model_id": model_info.get("id") or model_info.get("ocid") or model_info.get("model_id") or os.environ.get("OCI_GENAI_MODEL_OCID", ""),
+            "region": os.environ.get("OCI_REGION", "ap-sydney-1"),
+        }
+    try:
+        resp = requests.post(f"{API_ROOT}/chat/agentic", json=req, auth=SESS.auth, timeout=180)
+        data = resp.json()
+        answer = data.get("answer", "") if isinstance(data, dict) else str(data)
+        sources = data.get("sources", [])
+        chunk_metadata = data.get("chunk_metadata", [])
+        context_chunks = data.get("context_chunks", [])
+
+        steps = parse_agentic_markdown_to_steps(answer)
+        final_ans = ""
+        if steps and steps[-1][0].lower().startswith("final conclusion"):
+            final_ans = steps[-1][2]
+        else:
+            final_ans = answer
+        step_html = "<div class='agentic-cot-timeline'>"
+        for (title, label, content) in steps:
+            label_class = {
+                "Thought": "cot-thought",
+                "Action": "cot-action",
+                "Evidence": "cot-evidence",
+                "Reasoning": "cot-reason",
+                "Conclusion": "cot-conclusion"
+            }.get(label.capitalize(), "cot-other")
+            step_html += f"""
+            <div class='cot-card {label_class}'>
+                <div class='cot-card-title'>{html.escape(title)}</div>
+                <div class='cot-card-content'>{html.escape(content).replace("\\n", "<br>").replace("\n", "<br>")}</div>
+            </div>
+            """
+        step_html += "</div>"
+        answer_html = (
+            f"<div class='llm-answer-main'>{html.escape(final_ans).replace('\\n','<br>').replace('\n','<br>')}</div>"
+            + step_html +
+            format_context_cards(sources, chunk_metadata, context_chunks)
+        )
+    except Exception as e:
+        answer_html = f"Error querying agentic chat API: {e}"
+
+    if not isinstance(chat_history, list):
+        chat_history = []
+    chat_history.append({"role": "user", "content": message})
+    chat_history.append({
+        "role": "assistant",
+        "content": answer_html
+    })
+    def render_history(hist):
+        html_out = "<div class='chatbox-ct'>"
+        idx = 0
+        while idx < len(hist):
+            msg = hist[idx]
+            if msg["role"] == "user":
+                html_out += f"<div class='bubble user-bubble'><b>User:</b> {msg['content']}</div>"
+            elif msg["role"] == "assistant":
+                html_out += f"<div class='bubble assistant-bubble'><b>Assistant:</b> {msg['content']}</div>"
             idx += 1
         html_out += "</div>"
         return html_out or "<i>No conversation yet.</i>"
@@ -282,6 +370,43 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
     margin-bottom:12px;
     min-height: 32px;
 }
+.llm-answer-main {
+    color: #143b2b !important;
+    font-weight: bold;
+    font-size: 1.16em;
+    margin-bottom: 9px;
+    padding-top: 3px;
+}
+.agentic-cot-timeline {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 16px;
+    gap: 7px;
+}
+.cot-card {
+    border-radius: 7px;
+    padding: 8px 13px 6px 13px;
+    margin-bottom: 2px;
+    font-size: .99em;
+    font-family: Menlo, Monaco, 'SFMono-Regular', monospace;
+    border: 1.7px solid #ededf7;
+}
+.cot-card-title {
+    font-weight: bold;
+    color: #1a469f;
+    background: #f5f8ff;
+    padding: 2px 7px;
+    margin-bottom: 2.2px;
+    border-radius: 3px;
+    font-size: .99em;
+    display: inline-block;
+}
+.cot-thought    { border-left: 6px solid #3366cc; }
+.cot-action     { border-left: 6px solid #378a08; }
+.cot-evidence   { border-left: 6px solid #d68611; }
+.cot-reason     { border-left: 6px solid #9104b6; }
+.cot-conclusion { border-left: 6px solid #b12a2a; }
+.cot-other      { border-left: 6px solid #555; }
 .chatbox-ct {
     display: flex;
     flex-direction: column;
@@ -434,7 +559,6 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                 send_btn = gr.Button("Send")
                 conversation_html = gr.HTML(label="Conversation", value="", show_label=False)
 
-                # Show progress while backend call is in flight
                 def show_in_progress(*_):
                     return (
                         "<div class='chatbox-ct'><div class='bubble user-bubble'>Sending message...</div><div class='bubble assistant-bubble' style='color:#aaa;'><span class='spinner'></span> Fetching response...</div></div>",
@@ -452,6 +576,54 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                     inputs=[chat_message, chat_llm_source, chat_ollama_model, chat_oci_model,
                             chat_top_k, chat_history, chat_system_prompt, chat_temperature, chat_top_p, chat_max_tokens, chat_repeat_penalty],
                     outputs=[conversation_html, chat_history]
+                )
+            with gr.Tab("Agentic Chat"):
+                gr.Markdown("#### Agentic RAG/Chain-of-Thought Chat (Ollama and OCI GenAI)")
+                agent_llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
+                agent_ollama_model = gr.Dropdown(label="Ollama Model", choices=[], visible=True)
+                agent_oci_model = gr.Dropdown(label="OCI GenAI Model", choices=[], visible=False)
+                agent_top_k = gr.Number(label="Top K Context Chunks", value=10, precision=0)
+                agent_system_prompt = gr.Textbox(label="System Prompt", value=DEFAULT_SYSTEM_PROMPT, lines=3)
+                agent_temperature = gr.Slider(label="Temperature", value=0.1, minimum=0.0, maximum=1.5, step=0.01)
+                agent_top_p = gr.Slider(label="Top P", value=0.9, minimum=0.0, maximum=1.0, step=0.01)
+                agent_max_tokens = gr.Number(label="Max Tokens", value=1024, precision=0)
+                agent_repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.5, maximum=2.0, step=0.01)
+                agent_history = gr.State([])
+                def update_agent_model_dropdowns(src):
+                    if src == "OCI GenAI":
+                        return (
+                            gr.update(visible=False),
+                            gr.update(choices=fetch_oci_models(), visible=True)
+                        )
+                    else:
+                        return (
+                            gr.update(choices=fetch_ollama_models(), visible=True),
+                            gr.update(choices=[], visible=False)
+                        )
+                agent_llm_source.change(update_agent_model_dropdowns, inputs=[agent_llm_source], outputs=[agent_ollama_model, agent_oci_model])
+                agent_message = gr.Textbox(label="Your message", lines=2)
+                agent_send_btn = gr.Button("Send")
+                agent_conversation_html = gr.HTML(label="Conversation", value="", show_label=False)
+                def show_agentic_in_progress(*_):
+                    return (
+                        "<div class='chatbox-ct'><div class='bubble user-bubble'>Sending message...</div><div class='bubble assistant-bubble' style='color:#aaa;'><span class='spinner'></span> Reasoning step-by-step...</div></div>",
+                        gr.update()
+                    )
+                agent_send_btn.click(
+                    show_agentic_in_progress,
+                    inputs=[
+                        agent_message, agent_llm_source, agent_ollama_model, agent_oci_model,
+                        agent_top_k, agent_history, agent_system_prompt, agent_temperature, agent_top_p, agent_max_tokens, agent_repeat_penalty
+                    ],
+                    outputs=[agent_conversation_html, agent_history],
+                    queue=False
+                ).then(
+                    agentic_chat_fn,
+                    inputs=[
+                        agent_message, agent_llm_source, agent_ollama_model, agent_oci_model,
+                        agent_top_k, agent_history, agent_system_prompt, agent_temperature, agent_top_p, agent_max_tokens, agent_repeat_penalty
+                    ],
+                    outputs=[agent_conversation_html, agent_history]
                 )
     login_btn.click(
         login_fn,

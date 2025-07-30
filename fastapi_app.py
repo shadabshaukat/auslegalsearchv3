@@ -300,6 +300,84 @@ class ChatConversationReq(BaseModel):
     # oci config, if applicable
     oci_config: Optional[Dict[str, Any]] = None
 
+# --- Agentic Chat endpoint ---
+class ChatAgenticReq(BaseModel):
+    llm_source: str  # "ollama" or "oci_genai"
+    model: Optional[str] = None
+    message: str
+    chat_history: Optional[list] = None
+    system_prompt: Optional[str] = None
+    temperature: Optional[float] = 0.1
+    top_p: Optional[float] = 0.9
+    max_tokens: Optional[int] = 1024
+    repeat_penalty: Optional[float] = 1.1
+    top_k: Optional[int] = 10
+    oci_config: Optional[Dict[str, Any]] = None
+
+@app.post("/chat/agentic", tags=["chat"])
+def api_agentic_chat(req: ChatAgenticReq, _: str = Depends(get_current_user)):
+    """
+    Agentic Chat endpoint: Produces a chain-of-thought (multi-step) response from agent, with structured step trace for both Ollama and OCI GenAI.
+    """
+    # System prompt: force stepwise reasoning w/ explicit format (JSON or Markdown).
+    agent_prompt = (
+        (req.system_prompt or "")
+        + "\n\nYou are an expert legal agent. For every question, reason step by step with an explicit agentic chain of thought workflow." 
+          " For each step, output as:\n"
+          "Step X - Thought: ...\nStep X - Action: ...\nStep X - Evidence: ...\nStep X - Reasoning: ...\n"
+          "At the end, output Final Conclusion: ...\nBe sure to cite sources in each step using extracted evidence. Return all steps and final conclusion in Markdown format."
+    )
+
+    # Retrieve Top K as context (like RAG)
+    from db.store import search_hybrid
+    top_k = getattr(req, "top_k", 10) or 10
+    hybrid_hits = search_hybrid(req.message, top_k=top_k, alpha=0.5)
+    context_chunks = [h.get("text", "") for h in hybrid_hits]
+    sources = [h.get("citation") or ((h.get("chunk_metadata") or {}).get("url") if (h.get("chunk_metadata") or {}) else "?") for h in hybrid_hits]
+    chunk_metadata = [h.get("chunk_metadata") or {} for h in hybrid_hits]
+
+    out = {}
+    query_args = dict(
+        context_chunks=context_chunks,
+        sources=sources,
+        chunk_metadata=chunk_metadata,
+        custom_prompt=agent_prompt,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        repeat_penalty=req.repeat_penalty,
+        chat_history=req.chat_history,
+    )
+
+    if req.llm_source.lower() == "ollama":
+        rag = RAGPipeline(model=req.model or "llama3")
+        llm_resp = rag.query(req.message, **query_args)
+        answer = llm_resp.get("answer", "")
+    elif req.llm_source.lower() == "oci_genai":
+        config = req.oci_config or {}
+        compartment_id = config.get("compartment_id") or os.environ.get("OCI_COMPARTMENT_OCID", "")
+        model_id = config.get("model_id") or os.environ.get("OCI_GENAI_MODEL_OCID", "")
+        region = config.get("region") or os.environ.get("OCI_REGION", "")
+        pipeline = OCIGenAIPipeline(
+            compartment_id=compartment_id,
+            model_id=model_id,
+            region=region
+        )
+        llm_resp = pipeline.query(
+            question=req.message,
+            **query_args
+        )
+        answer = llm_resp.get("answer", "")
+    else:
+        raise HTTPException(400, f"Unknown llm_source {req.llm_source}")
+
+    out["answer"] = answer
+    out["sources"] = sources
+    out["context_chunks"] = context_chunks
+    out["chunk_metadata"] = chunk_metadata
+    # Optionally parse out steps (if you want special structure—UI may parse Markdown)
+    return out
+
 @app.post("/chat/conversation", tags=["chat"])
 def api_conversational_chat(req: ChatConversationReq, _: str = Depends(get_current_user)):
     """
