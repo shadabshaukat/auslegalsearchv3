@@ -1,5 +1,5 @@
 """
-FastAPI backend for AUSLegalSearchv3, with legal-tuned hybrid QA, legal-aware chunking, RAG, reranker interface, and full system prompt config.
+FastAPI backend for AUSLegalSearchv3, with legal-tuned hybrid QA, legal-aware chunking, RAG, reranker interface, OCI GenAI, Oracle 23ai DB, and full system prompt config.
 """
 
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
@@ -19,6 +19,8 @@ from db.store import (
 )
 from embedding.embedder import Embedder
 from rag.rag_pipeline import RAGPipeline, list_ollama_models
+from rag.oci_rag_pipeline import OCIGenAIPipeline
+from db.oracle23ai_connector import Oracle23AIConnector
 from ingest.loader import walk_legal_files, parse_txt, parse_html, chunk_document
 
 RERANKER_DATA_PATH = "./reranker_models.json"
@@ -61,8 +63,8 @@ def download_hf_model(hf_repo):
 
 app = FastAPI(
     title="AUSLegalSearchv3 API",
-    description="REST API for legal vector search, ingestion, RAG, chat, reranker, and system prompt management.",
-    version="0.30"
+    description="REST API for legal vector search, ingestion, RAG, chat, reranker, system prompt, OCI GenAI, and Oracle 23ai DB.",
+    version="0.40"
 )
 
 security = HTTPBasic()
@@ -237,6 +239,46 @@ def api_search_rag(req: RagReq, _: str = Depends(get_current_user)):
         **query_kwargs
     )
 
+# === OCI GenAI RAG endpoints ===
+class OCIConfig(BaseModel):
+    compartment_id: str
+    model_id: str
+    region: Optional[str] = None
+    # optionally allow oci_config dict if needed in future
+
+class OCIRagReq(BaseModel):
+    oci_config: OCIConfig
+    question: str
+    context_chunks: Optional[List[str]] = None
+    sources: Optional[List[str]] = None
+    chunk_metadata: Optional[List[Dict[str, Any]]] = None
+    custom_prompt: Optional[str] = None
+    temperature: float = 0.1
+    top_p: float = 0.9
+    max_tokens: int = 1024
+    repeat_penalty: float = 1.1
+    chat_history: Optional[List[Dict[str, Any]]] = None
+
+@app.post("/search/oci_rag", tags=["search", "oci"])
+def api_search_oci_rag(req: OCIRagReq, _: str = Depends(get_current_user)):
+    pipeline = OCIGenAIPipeline(
+        compartment_id=req.oci_config.compartment_id,
+        model_id=req.oci_config.model_id,
+        region=req.oci_config.region
+    )
+    return pipeline.query(
+        question=req.question,
+        context_chunks=req.context_chunks,
+        sources=req.sources,
+        chunk_metadata=req.chunk_metadata,
+        custom_prompt=req.custom_prompt,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        repeat_penalty=req.repeat_penalty,
+        chat_history=req.chat_history,
+    )
+
 # --- Chat Session endpoints ---
 class ChatMsg(BaseModel):
     prompt: str
@@ -258,7 +300,104 @@ def api_chat_session(msg: ChatMsg, _: str = Depends(get_current_user)):
         "chunk_metadata": chunk_metadata
     }
 
+# === Oracle 23ai DB endpoints ===
+class Oracle23aiQueryReq(BaseModel):
+    user: Optional[str] = None
+    password: Optional[str] = None
+    dsn: Optional[str] = None
+    wallet_location: Optional[str] = None
+    sql: str
+    params: Optional[List[Any]] = None
+
+@app.post("/db/oracle23ai_query", tags=["db", "oracle"])
+def api_oracle23ai_query(req: Oracle23aiQueryReq, _: str = Depends(get_current_user)):
+    connector = Oracle23AIConnector(
+        user=req.user,
+        password=req.password,
+        dsn=req.dsn,
+        wallet_location=req.wallet_location
+    )
+    try:
+        results = connector.run_query(req.sql, tuple(req.params or ()))
+        return results
+    finally:
+        connector.close()
+
 # --- Utility/model endpoints ---
+@app.get("/models/oci_genai", tags=["models"])
+def api_oci_genai_models(_: str = Depends(get_current_user)):
+    """
+    List available OCI GenAI LLM models for the configured compartment/region.
+    Returns OCID and display name for each model supporting TextGeneration.
+    """
+    import os
+    try:
+        import oci
+        from oci.generative_ai_inference import GenerativeAiInferenceClient
+        compartment_id = os.environ.get("OCI_COMPARTMENT_OCID", "")
+        region = os.environ.get("OCI_REGION", "ap-sydney-1")
+        config = {
+            "user": os.environ.get("OCI_USER_OCID", ""),
+            "key_file": os.environ.get("OCI_KEY_FILE", os.path.expanduser("~/.oci/oci_api_key.pem")),
+            "fingerprint": os.environ.get("OCI_KEY_FINGERPRINT", ""),
+            "tenancy": os.environ.get("OCI_TENANCY_OCID", ""),
+            "region": region,
+        }
+        profile = os.environ.get("OCI_CONFIG_PROFILE", "DEFAULT")
+        try:
+            file_conf = oci.config.from_file("~/.oci/config", profile_name=profile)
+            config.update(file_conf)
+        except Exception:
+            pass
+        config["user"] = os.environ.get("OCI_USER_OCID", config.get("user", ""))
+        config["key_file"] = os.environ.get("OCI_KEY_FILE", config.get("key_file", os.path.expanduser("~/.oci/oci_api_key.pem")))
+        config["fingerprint"] = os.environ.get("OCI_KEY_FINGERPRINT", config.get("fingerprint", ""))
+        config["tenancy"] = os.environ.get("OCI_TENANCY_OCID", config.get("tenancy", ""))
+        config["region"] = os.environ.get("OCI_REGION", config.get("region", "ap-sydney-1"))
+        client = GenerativeAiInferenceClient(config)
+        # Prefer to only list Oracle-provided PRETRAINED chat models
+        try:
+            resp = client.list_models(
+                compartment_id=compartment_id,
+                lifecycle_state="ACTIVE",
+                model_listing_type="PRETRAINED"
+            )
+        except TypeError:
+            # Fallback for SDKs that don't support model_listing_type param
+            resp = client.list_models(
+                compartment_id=compartment_id,
+                lifecycle_state="ACTIVE"
+            )
+        filtered = []
+        debug_list = []
+        for model in getattr(resp, "data", []):
+            attrs = {}
+            for k in dir(model):
+                if k.startswith("_") or k == "parent":
+                    continue
+                try:
+                    v = getattr(model, k)
+                    json.dumps(v, default=str)
+                    attrs[k] = v
+                except Exception:
+                    continue
+            debug_list.append(attrs)
+            # Keep only base/prebuilt chat models: use category/model_type/operation_types
+            category = str(attrs.get("category", "")).lower()
+            modeltype = str(attrs.get("model_type", "")).lower() if "model_type" in attrs else ""
+            op_types = [str(op).lower() for op in attrs.get("operation_types", [])]
+            if "llm" in category or "chat" in modeltype or any("chat" in op for op in op_types):
+                filtered.append(attrs)
+        print("DEBUG: Returning Oracle PRETRAINED/Chat models:", json.dumps(filtered, indent=2, default=str))
+        try:
+            with open("oracle_model_debug_list.json", "w") as f:
+                json.dump(filtered, f, indent=2, default=str)
+        except Exception as e:
+            print("WARNING: Could not write oracle_model_debug_list.json:", e)
+        return {"all": filtered}
+    except Exception as e:
+        return [{"error": f"Failed to fetch OCI models, check backend logs. {e}"}]
+
 @app.get("/models/ollama", tags=["models"])
 def api_ollama_models(_: str = Depends(get_current_user)):
     return list_ollama_models()

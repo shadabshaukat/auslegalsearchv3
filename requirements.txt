@@ -18,3 +18,5 @@ fastapi
 pydantic
 html2text
 PyPDF2
+oci
+oracledb

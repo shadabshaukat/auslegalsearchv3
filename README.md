@@ -1,8 +1,8 @@
-# AUSLegalSearchv3 – Multi-Faceted Unified Legal AI Platform
+# AUSLegalSearchv3 – Multi-Faceted Unified Legal AI Platform (Ollama ⬄ OCI GenAI ⬄ Oracle 23ai)
 
 ---
 
-## Unified System Architecture
+## Unified System Architecture (v3)
 
 ```
                                               [ Route53 (DNS) ]
@@ -18,128 +18,150 @@
                           [Backend on Ubuntu VM]  (Private IP: e.g. 10.150.1.82)
                                   |
     +----------+-----------+----------+----------------------------------------+
-    |          |           |                                              |
-[FastAPI :8000]  [Gradio :7866+]  [Streamlit :8501]       [PGVector/PostgreSQL DB]
-    |          |           |                                              |
-    |          |           +---Intelligent Legal UI/Document Control------+         
-    |          +---Modern LLM-Driven Chat & Hybrid Search UI---+          
-    +---REST API, RAG, Embedding, Ingestion Control---+                  
+    |          |           |                                  |          |
+[FastAPI :8000]  [Gradio :7866+]  [Streamlit :8501]    [PGVector/PostgreSQL] [Oracle 23ai DB]
+    |          |           |                                  |          |
+    |          |           +---Modern LLM/Cloud UI (Gradio tabs: Hybrid, Chat, OCI GenAI)----+ 
+    |          +---Multisource LLM-driven Chat, Hybrid Search, OCI GenAI---+                 
+    +---REST API: ingestion, retrieval, RAG (Ollama and OCI), DB bridge----+                 
 ```
 
-### Components and Relationships
+### Key v3 Capabilities
 
-- **FastAPI backend (`:8000`)**: The unified API layer powering ingestion, advanced search (BM25, vector, hybrid), chat/RAG endpoints, and managing all data/model orchestration. All apps depend on FastAPI for business logic and DB interaction.
-- **Gradio frontend (`:7866`, fallback 7867-7879)**: Provides a modern, interactive UI supporting:
-    - Legal RAG Chat Assistant (vector-augmented, with custom prompt option)
-    - Unified search page (BM25, vector, hybrid)
-    - Ingestion, session, and document management
-    - Built for researchers, legal staff, and power users
-- **Streamlit frontend (`:8501`)**: Rapid document ingestion, search, and legal QA dashboard—great for demos, analytics, or non-technical users.
-- **Postgres/pgvector DB**: Stores both raw documents and high-dimensional embeddings for fast semantic/hybrid search, session state, and audit logs.
-- **Interoperation**: All components communicate over REST. User actions in either UI hit the FastAPI backend, which coordinates RAG, embedding, and vector retrieval.
-- **Security**: All external traffic flows through load balancer/WAF at the network edge; only required ports are whitelisted.
+- **Select LLM Source:** Use either local Ollama models _or_ Oracle Cloud GenAI for RAG/Augment/Chat via a unified dropdown in the Gradio UI.
+- **Dedicated GenAI Tab:** Configure OCI credentials (Compartment OCID, Model OCID, Region) and run direct Oracle GenAI QA/RAG queries interactively.
+- **Secondary DB Connectivity:** Query Oracle 23ai databases through the FastAPI backend for advanced legal/compliance/analytics flows.
+- **Legacy Support:** All local features and hybrid search underpinnings run unmodified if you choose only Ollama/backed search.
+- **Unified APIs:** All app UIs (Gradio, Streamlit) and future automation connect through a robust FastAPI foundation.
 
 ---
 
-## Deploying the Unified Stack
+## Deployment Instructions (v3)
 
-### 1. Server Prereqs & Installation
+### 1. System Prerequisites
 
 ```sh
 sudo apt update && sudo apt upgrade -y
 sudo apt install python3 python3-venv python3-pip git postgresql libpq-dev gcc unzip curl -y
 ```
 
-### 2. Clone & Prepare
+### 2. Clone, Prepare, and Install Dependencies
 
 ```sh
 git clone https://github.com/shadabshaukat/auslegalsearchv3.git
-cd auslegalsearchv2
+cd auslegalsearchv3
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+> The requirements.txt now installs [oci](https://pypi.org/project/oci/) for Oracle Cloud GenAI support and [oracledb](https://pypi.org/project/oracledb/) for Oracle DB connectivity.
 
-### 3. Setup DB & Env
+### 3. Environment Variables
 
-- Install and bootstrap PostgreSQL + [pgvector](https://github.com/pgvector/pgvector).
-- Create user/db as desired.
-- Set required ENV variables before starting:
-  ```
-  export AUSLEGALSEARCH_DB_HOST=localhost
-  export AUSLEGALSEARCH_DB_PORT=5432
-  export AUSLEGALSEARCH_DB_USER=postgres
-  export AUSLEGALSEARCH_DB_PASSWORD='YourPasswordHere'
-  export AUSLEGALSEARCH_DB_NAME=postgres
-  ```
+**Core Database Variables:**
 
-### 4. Whitelist Required Ports
+```
+export AUSLEGALSEARCH_DB_HOST=localhost
+export AUSLEGALSEARCH_DB_PORT=5432
+export AUSLEGALSEARCH_DB_USER=postgres
+export AUSLEGALSEARCH_DB_PASSWORD='YourPasswordHere'
+export AUSLEGALSEARCH_DB_NAME=postgres
+```
 
-- On your server/cloud firewall and internal iptables, open:
-  - **8000**: FastAPI (core REST API)
-  - **7866-7879**: Gradio UI (always starts at 7866, auto-fails over)
-  - **8501**: Streamlit UI
-- Example iptables:
-  ```sh
-  sudo iptables -I INPUT -p tcp --dport 8000 -j ACCEPT
-  sudo iptables -I INPUT -p tcp --dport 7866:7879 -j ACCEPT
-  sudo iptables -I INPUT -p tcp --dport 8501 -j ACCEPT
-  ```
+**API/Backend:**
+```
+export FASTAPI_API_USER=legal_api
+export FASTAPI_API_PASS=letmein
+export AUSLEGALSEARCH_API_URL=http://localhost:8000
+```
+
+**Oracle Cloud GenAI (set if using OCI features):**
+
+```
+export OCI_USER_OCID='ocid1.user.oc1...'
+export OCI_TENANCY_OCID='ocid1.tenancy.oc1...'
+export OCI_KEY_FILE='/path/to/oci_api_key.pem'
+export OCI_KEY_FINGERPRINT='xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx'
+export OCI_REGION='ap-sydney-1'
+export OCI_COMPARTMENT_OCID='ocid1.compartment.oc1...'
+export OCI_GENAI_MODEL_OCID='ocid1.generativeaiocid...'
+```
+- These are required for the "OCI GenAI" tab and any RAG/QA using Oracle GenAI.
+- You can also set these interactively from the Gradio UI for session-only usage.
+
+**Oracle 23ai DB integration (optional, for DB tab/api usage):**
+```
+export ORACLE_DB_USER='your_db_user'
+export ORACLE_DB_PASSWORD='your_db_password'
+export ORACLE_DB_DSN='your_db_high'
+export ORACLE_WALLET_LOCATION='/path/to/wallet/dir' # (optional, only for Autonomous DBs with wallet)
+```
+- These can also be provided per-request in the UI.
 
 ---
 
-### 5. Unified Launch: One-Command Startup
+### 4. Database/Firewall/Network Prep
 
-Run everything in one step:
+- Install and initialize **PostgreSQL** and **pgvector** as usual for core legal search functions.
+- Create users, DB, etc.
+- For Oracle 23ai features, provision and create connection string/wallet as directed by Oracle cloud documentation.
+- Open/forward these ports:
+  - 8000 (FastAPI)
+  - 7866-7879 (Gradio UI)
+  - 8501 (Streamlit UI)
+
+Example (for local/VM firewall):
+```sh
+sudo iptables -I INPUT -p tcp --dport 8000 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 7866:7879 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 8501 -j ACCEPT
+```
+
+---
+
+### 5. Starting and Stopping the Stack
+
+Launch all services:
 ```sh
 bash run_legalsearch_stack.sh
 ```
-- **This brings up all services and backgrounds them, checking/falling back on ports as needed.**
-- To stop everything:
-  ```
-  bash stop_legalsearch_stack.sh
-  ```
-- Gradio is always on 7866 unless busy, then increments to 7879.
-- FastAPI is always at 8000.
-- Streamlit is always at 8501 (or as configured).
-
----
-
-### 6. Application Overview (Unified Cross-UI Workflow)
-
-- **Ingestion**: Add new legal material (PDF, HTML, etc.)—handled from either Gradio or Streamlit UI. Triggers chunking, embedding, and DB storage.
-- **Search (BM25, vector, hybrid)**: Both UI frontends let you search by keywords, semantic similarity, or a fusion—either as direct search or as legal RAG helper for AI answers.
-- **RAG Legal Chat Assistant (Gradio)**: The flagship conversational search feature. Every message runs a live vector search, then passes those chunks (and any user prompt) to the LLM for context-augmented answers.
-- **Session management**: All activity is recorded in DB. Users can resume previous sessions, review history, and audit results.
-- **Extensibility**: Enables future integration of new frontends (e.g. mobile or lightweight web apps) via FastAPI endpoints.
-
----
-
-### 7. Security, Certificate, and Ops Notes
-
-- All public endpoints are WAF-protected, with only the three critical ports open.
-- Strong auth, roles, and audit capabilities are baked in (disable admin logins/development users ASAP for production).
-- Certificates: Use Let's Encrypt (with Route53 DNS challenge or Nginx reverse proxy) as described earlier for best public deployment hygiene.
-
----
-
-### 8. System Diagram
-
-For reference, your deployed system looks like:
-
+Stop all services:
+```sh
+bash stop_legalsearch_stack.sh
 ```
-[Users]  <--HTTPS(load balancers/WAF)--->  [FastAPI:8000 | Gradio:7866+ | Streamlit:8501]  <--> [Postgres/pgvector]
-           (all UIs go through FastAPI backend for core logic)
-```
+- Gradio: http://localhost:7866
+- FastAPI: http://localhost:8000
+- Streamlit: http://localhost:8501
+
+> Default startup script configurations remain unchanged from previous versions.
 
 ---
 
-## Contact, Support, and Contribution
+## Application Workflow (v3)
 
-- Raise issues or feature requests at the [GitHub repository](https://github.com/shadabshaukat/auslegalsearchv2)
-- Contributions (UI, search quality, embedding, legal workflow modules) are welcome.
+- **Ingestion**: Upload legal docs to index via UI—handled exactly as in v2.
+- **Search (BM25, Vector, Hybrid)**: Choose your retrieval method from both Gradio and Streamlit. Hybrid and Chat tabs allow for LLM source toggle (Ollama vs. OCI GenAI).
+- **RAG-Enabled Chat (Gradio)**: All chats/searches can use either local LLM models (Ollama, etc.) or call out to Oracle Cloud GenAI—toggle using the "LLM Source" dropdown.
+- **GenAI Tab**: Manage and test Oracle Cloud GenAI setup directly; set credentials and region once per session, run QA interactively, debug config.
+- **Oracle 23ai DB Integration**: Use the backend `/db/oracle23ai_query` endpoint for advanced legal/analytics DB queries, or integrate from future UI upgrades.
 
 ---
 
-**AUSLegalSearchv2 – Secure, unified, multi-modal legal intelligence for modern research and compliance.**
+## Security, Certificates, and Operational Notes
+
+- All network endpoints should be fronted by a WAF, load balancer, or HTTPS reverse proxy.
+- **Never** commit or expose your OCI/Oracle credentials; always use environment variables and/or mounted secrets!
+- Rotate/limit credentials as required by organizational policy.
+- Use Let's Encrypt for certificate management as described in previous documentation.
+
+---
+
+## Contact and Contribution
+
+Raise issues or PRs for v3 at:  
+[https://github.com/shadabshaukat/auslegalsearchv3](https://github.com/shadabshaukat/auslegalsearchv3)
+
+---
+
+**AUSLegalSearchv3 — Secure, unified, multi-cloud, multi-model legal AI search and analytics for the modern firm.**
