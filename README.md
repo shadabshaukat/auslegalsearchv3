@@ -1,8 +1,26 @@
-# AUSLegalSearchv3 – Multi-Faceted Unified Legal AI Platform (Ollama ⬄ OCI GenAI ⬄ Oracle 23ai)
+# AUSLegalSearchv3 — Agentic Multi-Faceted Legal AI Platform (Ollama ⬄ OCI GenAI ⬄ Oracle 23ai)
 
 ---
 
-## Unified System Architecture (v3)
+## 🚀 New in v3: Agentic RAG with Chain-of-Thought Reasoning
+
+**AUSLegalSearchv3 now includes Agentic Chain-of-Thought RAG — a world-class, explainable, multi-step reasoning engine for legal and compliance practitioners.**
+
+- **Agentic Chat Tab:** Natural language questions yield stepwise, structured reasoning (Chain-of-Thought, CoT). Each agentic answer details "Thought", "Action", "Evidence", "Reasoning", and "Conclusion" steps—driving trustworthy, auditable outcomes.
+- **Interactive UI:** Each CoT answer is shown with visual timeline cards and clear source citations, for legal-grade explainability.
+- **Seamless Model Switching:** Instantly toggle between local Ollama LLMs and Oracle Cloud GenAI for agentic RAG.
+- **Professional User Experience:** All tabs present clear progress/wait-state animations, robust error handling, and a big-tech–grade, modern UX.
+- **Reproducible Reasoning:** Every answer’s “chain” is preserved for transparency, audit, or retraining.
+
+### Example: UI Chain-of-Thought Flow
+
+![Example: Chain-of-Thought UI](agentic_cot_ui.png)
+
+---
+
+## Architecture and Workflow
+
+### System Overview
 
 ```
                                               [ Route53 (DNS) ]
@@ -21,22 +39,48 @@
     |          |           |                                  |          |
 [FastAPI :8000]  [Gradio :7866+]  [Streamlit :8501]    [PGVector/PostgreSQL] [Oracle 23ai DB]
     |          |           |                                  |          |
-    |          |           +---Modern LLM/Cloud UI (Gradio tabs: Hybrid, Chat, OCI GenAI)----+ 
+    |          |           +---Modern LLM/Cloud UI (Gradio tabs: Hybrid, Chat, OCI GenAI, Agentic)----+ 
     |          +---Multisource LLM-driven Chat, Hybrid Search, OCI GenAI---+                 
-    +---REST API: ingestion, retrieval, RAG (Ollama and OCI), DB bridge----+                 
+    +---REST API: ingestion, retrieval, RAG (Ollama and OCI), DB bridge, agentic reasoning----+                 
 ```
 
-### Key v3 Capabilities
+### Agentic RAG Chain-of-Thought Workflow
 
-- **Select LLM Source:** Use either local Ollama models _or_ Oracle Cloud GenAI for RAG/Augment/Chat via a unified dropdown in the Gradio UI.
-- **Dedicated GenAI Tab:** Configure OCI credentials (Compartment OCID, Model OCID, Region) and run direct Oracle GenAI QA/RAG queries interactively.
-- **Secondary DB Connectivity:** Query Oracle 23ai databases through the FastAPI backend for advanced legal/compliance/analytics flows.
-- **Legacy Support:** All local features and hybrid search underpinnings run unmodified if you choose only Ollama/backed search.
-- **Unified APIs:** All app UIs (Gradio, Streamlit) and future automation connect through a robust FastAPI foundation.
+```mermaid
+flowchart TD
+    UQ[User Question]
+    UI[Agentic Chat UI (Gradio)]
+    API[API POST /chat/agentic]
+    RETRIEVE[RAG Context Retrieval (Hybrid/Vector+BM25, Reranking)]
+    CHAIN[Chain-of-Thought Generation (LLM)]
+    STEPS[Reasoning Steps: Thought → Action → Evidence → Reasoning → Conclusion]
+    SOURCES[Source Cards/Snippets]
+    RESP[Structured Answer (+ Steps + Citations)]
+
+    UQ --> UI
+    UI --> API
+    API --> RETRIEVE
+    RETRIEVE --> CHAIN
+    CHAIN --> STEPS
+    STEPS --> RESP
+    RETRIEVE --> SOURCES
+    SOURCES -.-> RESP
+    RESP --> UI
+```
 
 ---
 
-## Deployment Instructions (v3)
+## Key Capabilities
+
+- **Agentic Chain-of-Thought RAG:** Legal query explanations as auditable, step-wise deductive timelines—unmatched for risk, compliance, research traceability.
+- **LLM Source Diversity:** Run RAG and Agentic queries using either Ollama or Oracle Cloud GenAI—one switch, zero config hassle.
+- **GenAI QA & RAG Tab:** Configure Oracle GenAI, see live status, and benchmark against local models instantly.
+- **Hybrid / Vector / BM25 Retrieval:** Pick search mode as needed; results are always shown with context, sources, and explainability.
+- **Plug-and-Play Backend:** All services—REST API, UI, Oracle DB, and PGVector—run together with clear network separation.
+
+---
+
+## Deployment Instructions
 
 ### 1. System Prerequisites
 
@@ -55,12 +99,11 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
-> The requirements.txt now installs [oci](https://pypi.org/project/oci/) for Oracle Cloud GenAI support and [oracledb](https://pypi.org/project/oracledb/) for Oracle DB connectivity.
+> Requirements include [oci](https://pypi.org/project/oci/) and [oracledb](https://pypi.org/project/oracledb/) for full GenAI and DB coverage.
 
-### 3. Environment Variables
+### 3. Environment Variables (v3+)
 
-**Core Database Variables:**
-
+**Database Setup:**
 ```
 export AUSLEGALSEARCH_DB_HOST=localhost
 export AUSLEGALSEARCH_DB_PORT=5432
@@ -76,8 +119,7 @@ export FASTAPI_API_PASS=letmein
 export AUSLEGALSEARCH_API_URL=http://localhost:8000
 ```
 
-**Oracle Cloud GenAI (set if using OCI features):**
-
+**Oracle Cloud GenAI:**
 ```
 export OCI_USER_OCID='ocid1.user.oc1...'
 export OCI_TENANCY_OCID='ocid1.tenancy.oc1...'
@@ -87,31 +129,22 @@ export OCI_REGION='ap-sydney-1'
 export OCI_COMPARTMENT_OCID='ocid1.compartment.oc1...'
 export OCI_GENAI_MODEL_OCID='ocid1.generativeaiocid...'
 ```
-- These are required for the "OCI GenAI" tab and any RAG/QA using Oracle GenAI.
-- You can also set these interactively from the Gradio UI for session-only usage.
 
-**Oracle 23ai DB integration (optional, for DB tab/api usage):**
+**Oracle 23ai DB integration (optional):**
 ```
 export ORACLE_DB_USER='your_db_user'
 export ORACLE_DB_PASSWORD='your_db_password'
 export ORACLE_DB_DSN='your_db_high'
-export ORACLE_WALLET_LOCATION='/path/to/wallet/dir' # (optional, only for Autonomous DBs with wallet)
+export ORACLE_WALLET_LOCATION='/path/to/wallet/dir'
 ```
-- These can also be provided per-request in the UI.
 
 ---
 
-### 4. Database/Firewall/Network Prep
+### 4. Network & Database Setup
 
-- Install and initialize **PostgreSQL** and **pgvector** as usual for core legal search functions.
-- Create users, DB, etc.
-- For Oracle 23ai features, provision and create connection string/wallet as directed by Oracle cloud documentation.
-- Open/forward these ports:
-  - 8000 (FastAPI)
-  - 7866-7879 (Gradio UI)
-  - 8501 (Streamlit UI)
-
-Example (for local/VM firewall):
+- PostgreSQL, PGVector, and any Oracle DBs as per your needs.
+- Open for: 8000 (FastAPI), 7866–7879 (Gradio), 8501 (Streamlit).
+- Example:
 ```sh
 sudo iptables -I INPUT -p tcp --dport 8000 -j ACCEPT
 sudo iptables -I INPUT -p tcp --dport 7866:7879 -j ACCEPT
@@ -120,48 +153,92 @@ sudo iptables -I INPUT -p tcp --dport 8501 -j ACCEPT
 
 ---
 
-### 5. Starting and Stopping the Stack
+### 5. Launch
 
-Launch all services:
 ```sh
 bash run_legalsearch_stack.sh
+# To stop: bash stop_legalsearch_stack.sh
+# Gradio:   http://localhost:7866
+# FastAPI:  http://localhost:8000
+# Streamlit http://localhost:8501
 ```
-Stop all services:
-```sh
-bash stop_legalsearch_stack.sh
+
+---
+
+## API Specification
+
+### `/chat/agentic` — Agentic Chain-of-Thought LLM Endpoint
+
+Submit a legal or compliance question and receive a structured chain-of-thought reasoning trace with cited sources.
+
+**POST** `/chat/agentic`
+#### Request
+```json
+{
+  "llm_source": "ollama",           // or "oci_genai"
+  "model": "llama3" | "orca-mini" | ...,
+  "message": "Explain the procedure for contesting a will in NSW.",
+  "chat_history": [],
+  "system_prompt": "...",
+  "temperature": 0.15,
+  "top_p": 0.9,
+  "max_tokens": 1920,
+  "repeat_penalty": 1.07,
+  "top_k": 12,
+  "oci_config": {
+    "compartment_id": "...", "model_id": "...", "region": "ap-sydney-1"
+  }
+}
 ```
-- Gradio: http://localhost:7866
-- FastAPI: http://localhost:8000
-- Streamlit: http://localhost:8501
 
-> Default startup script configurations remain unchanged from previous versions.
+#### Response
+```json
+{
+  "answer": "Step 1 - Thought: ...\nStep 2 - Action: ...\nFinal Conclusion: ...", // Markdown Chain-of-Thought trace
+  "sources": [
+    "Succession Act 2006 (NSW) s 96", "Practical Law Practice Note", "Case: Smith v Doe [2022] NSWSC 789"
+  ],
+  "chunk_metadata": [
+    {"citation": "Succession Act 2006 (NSW) s 96", "url": "https://legislation.nsw.gov.au/view/html/inforce/current/act-2006-080#sec.96"},
+    ...
+  ],
+  "context_chunks": [
+    "Section 96 of the Act provides that...",
+    "The general process in New South Wales is..."
+  ]
+}
+```
+
+**Notes:**
+- Each CoT step is prefixed as "Step X - [Label]:" for consistent downstream parsing/display.
+- Sources/citations and context are matched to each reasoning step for legal traceability.
+- Error handling will yield string "answer" fields with diagnostics on failure.
 
 ---
 
-## Application Workflow (v3)
+## Application Workflow
 
-- **Ingestion**: Upload legal docs to index via UI—handled exactly as in v2.
-- **Search (BM25, Vector, Hybrid)**: Choose your retrieval method from both Gradio and Streamlit. Hybrid and Chat tabs allow for LLM source toggle (Ollama vs. OCI GenAI).
-- **RAG-Enabled Chat (Gradio)**: All chats/searches can use either local LLM models (Ollama, etc.) or call out to Oracle Cloud GenAI—toggle using the "LLM Source" dropdown.
-- **GenAI Tab**: Manage and test Oracle Cloud GenAI setup directly; set credentials and region once per session, run QA interactively, debug config.
-- **Oracle 23ai DB Integration**: Use the backend `/db/oracle23ai_query` endpoint for advanced legal/analytics DB queries, or integrate from future UI upgrades.
-
----
-
-## Security, Certificates, and Operational Notes
-
-- All network endpoints should be fronted by a WAF, load balancer, or HTTPS reverse proxy.
-- **Never** commit or expose your OCI/Oracle credentials; always use environment variables and/or mounted secrets!
-- Rotate/limit credentials as required by organizational policy.
-- Use Let's Encrypt for certificate management as described in previous documentation.
+- **Ingestion**: Document upload and indexing for efficient search and legal analytics.
+- **Search (BM25, Vector, Hybrid)**: Choice of retrieval for flexibility and accuracy.
+- **Agentic Chat/CoT**: Every question yields a detailed, structured reasoning path, backed by cited context.
+- **GenAI & Oracle DBs**: Integrated, no-fuss access and configuration from the UI tabs.
 
 ---
 
-## Contact and Contribution
+## Security and Operations
 
-Raise issues or PRs for v3 at:  
+- Always secure endpoints behind WAF, firewall, or proxy.
+- Store all credentials OUTSIDE your repo, in environment or secret managers.
+- Use Let's Encrypt for TLS by default.
+- Rotating secrets and policy compliance is essential for enterprise rollout.
+
+---
+
+## Contribution and Support
+
+Raise issues, feature requests, or PRs at:  
 [https://github.com/shadabshaukat/auslegalsearchv3](https://github.com/shadabshaukat/auslegalsearchv3)
 
 ---
 
-**AUSLegalSearchv3 — Secure, unified, multi-cloud, multi-model legal AI search and analytics for the modern firm.**
+**AUSLegalSearchv3 — Enterprise-grade, agentic, explainable legal AI built for the modern legal practice.**

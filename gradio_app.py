@@ -303,7 +303,17 @@ def agentic_chat_fn(message, llm_source, ollama_model, oci_model_info_json, top_
     try:
         resp = requests.post(f"{API_ROOT}/chat/agentic", json=req, auth=SESS.auth, timeout=180)
         data = resp.json()
+        # If answer is a dict or JSON string, extract the text. If it's not a str, get its .get("answer").
         answer = data.get("answer", "") if isinstance(data, dict) else str(data)
+        # If it's still a JSON/dict-looking string, try to extract text field cleanly, ignore JSON:
+        try:
+            if isinstance(answer, str) and answer.strip().startswith("{"):
+                parsed = json.loads(answer)
+                answer = parsed.get("answer", answer)
+        except Exception:
+            pass
+        if not isinstance(answer, str):
+            answer = str(answer)
         sources = data.get("sources", [])
         chunk_metadata = data.get("chunk_metadata", [])
         context_chunks = data.get("context_chunks", [])
@@ -347,14 +357,20 @@ def agentic_chat_fn(message, llm_source, ollama_model, oci_model_info_json, top_
     })
     def render_history(hist):
         html_out = "<div class='chatbox-ct'>"
-        idx = 0
-        while idx < len(hist):
-            msg = hist[idx]
-            if msg["role"] == "user":
-                html_out += f"<div class='bubble user-bubble'><b>User:</b> {msg['content']}</div>"
-            elif msg["role"] == "assistant":
-                html_out += f"<div class='bubble assistant-bubble'><b>Assistant:</b> {msg['content']}</div>"
-            idx += 1
+        # Always show the most recent user message, then the full chain as assistant. Only one exchange is shown.
+        if len(hist) >= 2:
+            last_user = hist[-2]
+            last_assistant = hist[-1]
+            if last_user["role"] == "user":
+                html_out += f"<div class='bubble user-bubble'><b>User:</b> {last_user['content']}</div>"
+            if last_assistant["role"] == "assistant":
+                html_out += f"<div class='bubble assistant-bubble'><b>Assistant:</b> {last_assistant['content']}</div>"
+        else:
+            for msg in hist:
+                if msg["role"] == "user":
+                    html_out += f"<div class='bubble user-bubble'><b>User:</b> {msg['content']}</div>"
+                elif msg["role"] == "assistant":
+                    html_out += f"<div class='bubble assistant-bubble'><b>Assistant:</b> {msg['content']}</div>"
         html_out += "</div>"
         return html_out or "<i>No conversation yet.</i>"
     return render_history(chat_history), chat_history
@@ -464,6 +480,19 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
     background: #f8fafd;
     padding: 2.8px 5px 2.8px 5px;
     border-radius: 4px;
+}
+.spinner {
+    display:inline-block;
+    width:1.1em;
+    height:1.1em;
+    border:2.7px solid #abbada;
+    border-radius:50%;
+    border-top-color:#378a08;
+    animation: spin 0.77s linear infinite;
+    vertical-align:middle;
+}
+@keyframes spin {
+  to {transform: rotate(360deg);}
 }
 """) as demo:
     gr.Markdown("# AUSLegalSearch RAG Platform")
@@ -589,6 +618,7 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                 agent_max_tokens = gr.Number(label="Max Tokens", value=1024, precision=0)
                 agent_repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.5, maximum=2.0, step=0.01)
                 agent_history = gr.State([])
+
                 def update_agent_model_dropdowns(src):
                     if src == "OCI GenAI":
                         return (
@@ -600,15 +630,26 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                             gr.update(choices=fetch_ollama_models(), visible=True),
                             gr.update(choices=[], visible=False)
                         )
+
                 agent_llm_source.change(update_agent_model_dropdowns, inputs=[agent_llm_source], outputs=[agent_ollama_model, agent_oci_model])
                 agent_message = gr.Textbox(label="Your message", lines=2)
                 agent_send_btn = gr.Button("Send")
                 agent_conversation_html = gr.HTML(label="Conversation", value="", show_label=False)
-                def show_agentic_in_progress(*_):
-                    return (
-                        "<div class='chatbox-ct'><div class='bubble user-bubble'>Sending message...</div><div class='bubble assistant-bubble' style='color:#aaa;'><span class='spinner'></span> Reasoning step-by-step...</div></div>",
-                        gr.update()
+
+                def show_agentic_in_progress(*args):
+                    # Defensive: if agent_message is None/default, ensure user_msg is a string
+                    if args and len(args) > 0 and args[0] is not None:
+                        user_msg = str(args[0])
+                    else:
+                        user_msg = ""
+                    progress_html = (
+                        "<div class='chatbox-ct'>"
+                        "<div class='bubble user-bubble'><b>User:</b> " + html.escape(user_msg) + "</div>"
+                        "<div class='bubble assistant-bubble'><span class='spinner'></span> <span style='color:#888;'>Thinking…</span></div>"
+                        "</div>"
                     )
+                    return progress_html, []
+
                 agent_send_btn.click(
                     show_agentic_in_progress,
                     inputs=[
