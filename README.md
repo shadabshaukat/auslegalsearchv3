@@ -46,27 +46,7 @@
 
 ### Agentic RAG Chain-of-Thought Workflow
 
-```mermaid
-flowchart TD
-    UQ[User Question]
-    UI[Agentic Chat UI (Gradio)]
-    API[API POST /chat/agentic]
-    RETRIEVE[RAG Context Retrieval (Hybrid/Vector+BM25, Reranking)]
-    CHAIN[Chain-of-Thought Generation (LLM)]
-    STEPS[Reasoning Steps: Thought → Action → Evidence → Reasoning → Conclusion]
-    SOURCES[Source Cards/Snippets]
-    RESP[Structured Answer (+ Steps + Citations)]
 
-    UQ --> UI
-    UI --> API
-    API --> RETRIEVE
-    RETRIEVE --> CHAIN
-    CHAIN --> STEPS
-    STEPS --> RESP
-    RETRIEVE --> SOURCES
-    SOURCES -.-> RESP
-    RESP --> UI
-```
 
 ---
 
