@@ -1,269 +1,214 @@
 """
-Gradio frontend for AUSLegalSearchv3:
-- Default Top K is now 10 for Hybrid, Vector, Chat retrievals.
-- Chat Tab exposes controls for temperature, top_p, max_tokens, repeat_penalty for customizing the LLM's behavior. These are sent to the FastAPI backend for each response.
+AUSLegalSearchv3 Gradio UI:
+- Tabs for Hybrid Search, Vector Search, and 'RAG' (unified chatbot).
+- RAG tab: Improved LLM/model selection, Top K, source/context formatting. Displays all available OCI GenAI models, even with fallback key logic.
 """
 
 import gradio as gr
 import requests
 import os
+import html
+import json
 
 API_ROOT = os.environ.get("AUSLEGALSEARCH_API_URL", "http://localhost:8000")
-
-class APISession:
-    def __init__(self):
-        self.user = None
-        self.auth = None
-        self.history = []
-
-    def login(self, username, password):
-        try:
-            r = requests.get(f"{API_ROOT}/health", auth=(username, password), timeout=10)
-            if r.ok:
-                self.auth = (username, password)
-                self.user = username
-                return True
-        except Exception:
-            pass
-        return False
-
-SESS = APISession()
+SESS = type("Session", (), {"user": None, "auth": None})()
+SESS.auth = None
 
 LEGAL_SYSTEM_PROMPT = """You are an expert Australian legal research and compliance AI assistant.
 Answer strictly from the provided sources and context. Always cite the source section/citation for every statement. If you do not know the answer from the context, reply: "Not found in the provided legal documents."
 When summarizing, be neutral and factual. Never invent legal advice."""
 
-def fetch_llm_and_reranker_choices():
-    llms, rerankers = [], []
-    try:
-        r = requests.get(f"{API_ROOT}/models/ollama", auth=SESS.auth, timeout=10)
-        if r.ok and isinstance(r.json(), list):
-            llms = r.json()
-    except Exception:
-        pass
-    try:
-        r = requests.get(f"{API_ROOT}/models/rerankers", auth=SESS.auth, timeout=10)
-        if r.ok and isinstance(r.json(), list):
-            rerankers = r.json()
-    except Exception:
-        pass
-    return llms, rerankers
-
 def login_fn(username, password):
-    login_ok = SESS.login(username, password)
-    if not login_ok:
-        return (
-            gr.update(visible=True), gr.update(visible=False), "",
-            "Invalid login.",
-            gr.update(choices=[], value="", allow_custom_value=True),
-            gr.update(choices=[], value="", allow_custom_value=True),
-            gr.update(choices=[], value="", allow_custom_value=True),
-            gr.update(choices=[], value="", allow_custom_value=True),
-            gr.update(choices=[], value="", allow_custom_value=True),
-            gr.update(choices=[], value="", allow_custom_value=True)
-        )
-    llm_choices, reranker_choices = fetch_llm_and_reranker_choices()
-    default_llm = llm_choices[0] if llm_choices else ""
-    default_reranker = reranker_choices[0] if reranker_choices else ""
-    dropdown_out = gr.update(choices=llm_choices, value=default_llm, allow_custom_value=True)
-    reranker_out = gr.update(choices=reranker_choices, value=default_reranker, allow_custom_value=True)
-    return (
-        gr.update(visible=False),
-        gr.update(visible=True),
-        f"Welcome, {username}!",
-        "",
-        dropdown_out,          # hybrid_llm_model
-        reranker_out,          # hybrid_reranker_model
-        dropdown_out,          # vector_llm_model
-        reranker_out,          # vector_reranker_model
-        dropdown_out,          # chat_llm_model
-        reranker_out           # chat_reranker_model
-    )
-
-def format_metadata(meta: dict):
-    if not meta:
-        return ""
-    out = ["<div style='padding:1px 0 6px 0'><b>Metadata:</b><ul style='margin:4px 0 4px 14px;padding:0;'>"]
-    for k, v in meta.items():
-        if k == "url":
-            continue
-        out.append(f"<li style='font-size:.98em;'><span style='color:#476088;'>{k}:</span> <code style='color:#347;'>"
-                   f"{str(v)}</code></li>")
-    out.append("</ul></div>")
-    return "".join(out)
-
-def format_hybrid_results(hits):
-    if not hits:
-        return "No results found."
-    out = "<div style='display:flex;flex-direction:column;gap:1em;'>"
-    for idx, h in enumerate(hits, 1):
-        meta = h.get("chunk_metadata") or {}
-        citation = h.get("citation") or (meta.get("url") if meta and meta.get("url") else "?")
-        url = meta.get("url")
-        url_part = f'<a href="{url}" target="_blank">{citation}</a>' if url else citation
-        score = f"{h.get('hybrid_score', 0):.3f}"
-        text = h.get("text", "")[:700]
-        out += f"""
-        <div style='border-radius:9px;border:1.5px solid #ececec;padding:14px 18px;background:#fafdff;margin-bottom:4px;'>
-            <div style='font-weight:bold;margin-bottom:.1em'>{url_part}</div>
-            <div style='color:#34758d;font-size:.92em;'>Confidence: <b>{score}</b></div>
-            <div style='margin: 8px 0 7px 0;line-height:1.56;'>{text}{'...' if len(h.get('text', ''))>700 else ''}</div>
-            {format_metadata(meta)}
-        </div>
-        """
-    out += "</div>"
-    return out
-
-def hybrid_search_fn(query, top_k, alpha, prompt, llm_model, reranker_model):
-    processing_html = "<div style='color:#888;font-style:italic;margin:.7em 0;'>Processing…</div>"
-    table_md, answer_html, sources_md = "", processing_html, ""
     try:
-        resp = requests.post(f"{API_ROOT}/search/hybrid", json={
-            "query": query, "top_k": int(top_k), "alpha": float(alpha), "reranker": reranker_model
-        }, timeout=30, auth=SESS.auth)
-        resp.raise_for_status()
-        hits = resp.json()
-    except Exception:
-        return format_hybrid_results([]), "", ""
-    if not hits:
-        return "No results found for this query.", "", ""
-    table_md = format_hybrid_results(hits)
-    context_chunks = [h["text"] for h in hits]
-    citation_list = [h.get("citation") or ((h.get("chunk_metadata") or {}).get("url") if (h.get("chunk_metadata") or {}) else "?") for h in hits]
-    try:
-        rag_payload = {
-            "question": query,
-            "context_chunks": context_chunks,
-            "sources": citation_list,
-            "custom_prompt": prompt,
-            "model": llm_model,
-            "reranker_model": reranker_model,
-            "top_k": int(top_k)
-        }
-        r_rag = requests.post(f"{API_ROOT}/search/rag", json=rag_payload, auth=SESS.auth)
-        rag_data = r_rag.json() if r_rag.ok else {}
-        answer = rag_data.get("answer", "")
-    except Exception:
-        answer = ""
-    sources_md = ""
-    if citation_list:
-        sources_boxes = " ".join([
-            f"<span style='border-radius:6px;background:#e7f1fe;color:#234;font-size:.93em;padding:4px 12px 4px 12px;margin:5px 5px 5px 0;display:inline-block;'>{c}</span>"
-            for c in citation_list
-        ])
-        sources_md = f"<div style='margin-top:7px;margin-bottom:4px;'>Sources: {sources_boxes}</div>"
-    answer_html = f"<div style='color:#10890b;font-size:1.1em;font-family:Menlo,Monaco,monospace;margin-top:0.5em;white-space:pre-wrap'>{answer}</div>" if answer else ""
-    return table_md, answer_html, sources_md
-
-def format_vector_results(hits):
-    if not hits:
-        return "No vector results found."
-    out = "<div style='display:flex;flex-direction:column;gap:1em;'>"
-    for h in hits:
-        meta = h.get("chunk_metadata") or {}
-        url = meta.get("url")
-        citation = h.get("citation") or (url if url else "?")
-        url_part = f'<a href="{url}" target="_blank">{citation}</a>' if url else citation
-        score = h.get("score", 0)
-        text_short = h.get("text", "")[:650]
-        out += f"""
-        <div style='border-radius:8px;border:1.2px solid #ecedf0;padding:11px 16px;background:#fcfdfe;margin-bottom:3px;'>
-            <div style='font-weight:bold;'>{url_part}</div>
-            <div style='color:#3a7096;font-size:.91em;'>Score: <b>{score:.3f}</b></div>
-            <div style='margin: 8px 0 5px 0;line-height:1.51;'>{text_short}{'...' if len(h.get('text', ''))>650 else ''}</div>
-            {format_metadata(meta)}
-        </div>
-        """
-    out += "</div>"
-    return out
-
-def vector_search_fn(query, top_k, reranker_model, llm_model):
-    try:
-        resp = requests.post(f"{API_ROOT}/search/vector", json={
-            "query": query, "top_k": int(top_k), "reranker": reranker_model, "llm_model": llm_model
-        }, timeout=30, auth=SESS.auth)
-        resp.raise_for_status()
-        hits = resp.json()
-    except Exception as e:
-        return "Vector search error: %s" % e
-    return format_vector_results(hits)
-
-def gradio_chat_history_from_history(history):
-    chat_msgs = []
-    for item in history or []:
-        if "role" in item and "content" in item and item["role"] in ("user","assistant"):
-            chat_msgs.append({"role": item["role"], "content": item["content"]})
-        elif isinstance(item, list) and len(item)==2:
-            chat_msgs.append({"role": "user", "content": item[0]})
-            chat_msgs.append({"role": "assistant", "content": item[1]})
-    return chat_msgs
-
-def backend_chat_history_from_history(history):
-    chat_msgs = []
-    for item in history or []:
-        if "role" in item and "content" in item and item["role"] in ("user","assistant"):
-            chat_msgs.append({"role": item["role"], "content": item["content"]})
-        elif isinstance(item, list) and len(item)==2:
-            chat_msgs.append({"role": "user", "content": item[0]})
-            chat_msgs.append({"role": "assistant", "content": item[1]})
-    return chat_msgs
-
-def chat_tab_fn(message, history, chat_top_k, temperature, top_p, max_tokens, repeat_penalty, llm_model, reranker_model):
-    N = 2
-    history_qa = []
-    tmp = []
-    for msg in backend_chat_history_from_history(history):
-        if msg["role"] == "user":
-            tmp = [msg["content"]]
-        elif msg["role"] == "assistant" and tmp:
-            tmp.append(msg["content"])
-            history_qa.append(tmp)
-            tmp = []
-    last_qa_chunks = []
-    for q, a in history_qa[-N:]:
-        last_qa_chunks.append(f"User: {q}\nAssistant: {a}")
-    try:
-        search_resp = requests.post(f"{API_ROOT}/search/hybrid", json={
-            "query": message, "top_k": int(chat_top_k), "alpha": 0.5, "reranker": reranker_model
-        }, auth=SESS.auth, timeout=20)
-        search_resp.raise_for_status()
-        hits = search_resp.json()
-        top_chunks = [h.get("text", "") for h in hits]
-        sources = [h.get("citation") or ((h.get("chunk_metadata") or {}).get("url") if (h.get("chunk_metadata") or {}) else "?") for h in hits]
-        metas = [h.get("chunk_metadata") or {} for h in hits]
-    except Exception:
-        top_chunks, sources, metas = [], [], []
-    final_context = last_qa_chunks + top_chunks
-    backend_history = backend_chat_history_from_history(history)
-    rag_payload = {
-        "question": message,
-        "context_chunks": final_context,
-        "sources": sources,
-        "chunk_metadata": metas,
-        "chat_history": backend_history,
-        "model": llm_model,
-        "reranker_model": reranker_model,
-        "custom_prompt": LEGAL_SYSTEM_PROMPT,
-        "top_k": int(chat_top_k),
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "max_tokens": int(max_tokens),
-        "repeat_penalty": float(repeat_penalty)
-    }
-    try:
-        resp = requests.post(f"{API_ROOT}/search/rag", json=rag_payload, auth=SESS.auth)
-        if resp.ok:
-            answer = resp.json().get("answer", "")
-            new_hist = gradio_chat_history_from_history(history) + [{"role":"user","content":message},{"role":"assistant","content":answer}]
-            return new_hist, "", gr.update(value="")
+        r = requests.get(f"{API_ROOT}/health", auth=(username, password), timeout=10)
+        if r.ok:
+            SESS.auth = (username, password)
+            return gr.update(visible=False), gr.update(visible=True), f"Welcome, {username}!", ""
         else:
-            new_hist = gradio_chat_history_from_history(history) + [{"role":"user","content":message}]
-            return new_hist, f"Chat error: {resp.text}", gr.update(value="")
-    except Exception as e:
-        new_hist = gradio_chat_history_from_history(history) + [{"role":"user","content":message}]
-        return new_hist, f"Chat error: {e}", gr.update(value="")
+            return gr.update(visible=True), gr.update(visible=False), "", "Invalid login."
+    except Exception:
+        return gr.update(visible=True), gr.update(visible=False), "", "Invalid login."
 
-with gr.Blocks(title="AUSLegalSearch Gradio Minimalist UX", css="""
+def fetch_oci_models():
+    try:
+        resp = requests.get(f"{API_ROOT}/models/oci_genai", auth=SESS.auth, timeout=30)
+        data = resp.json() if resp.ok else {}
+        all_models = data.get("all", []) if isinstance(data, dict) else []
+
+        # Save for troubleshooting
+        try:
+            with open("oci_models_debug.json", "w") as f:
+                json.dump(all_models, f, indent=2, default=str)
+            if all_models:
+                print("First 2 Oracle model objects (debug):", json.dumps(all_models[:2], indent=2, default=str))
+        except Exception as e:
+            print("Warning: Could not write oci_models_debug.json", e)
+
+        filtered = []
+        for m in all_models:
+            # Show all keys for each model (debug)
+            print("Model keys:", list(m.keys()))
+            # Extract model name and OCID using any present key
+            display = (
+                m.get("display_name")
+                or m.get("model_name")
+                or m.get("name")
+                or m.get("id")
+                or m.get("ocid")
+                or str(m)
+            )
+            ocid = m.get("id") or m.get("ocid") or m.get("model_id") or ""
+            # Put together as label and dropdown value
+            capdesc = []
+            if m.get("category"):
+                capdesc.append(m["category"])
+            if m.get("capabilities"):
+                capdesc.extend([str(c) for c in m["capabilities"]])
+            if m.get("operation_types"):
+                capdesc.extend(["[ops: " + ", ".join(m["operation_types"]) + "]"])
+            label = f"{display} ({', '.join(capdesc)})" if capdesc else display
+            # Only list if an OCID/id is present
+            if ocid:
+                filtered.append((label, json.dumps(m)))
+        # If nothing, show a clear UI diagnostic message instead of empty dropdown
+        if not filtered:
+            filtered.append(("No OCI GenAI models found. Check Oracle Console/config.", ""))
+        return filtered
+    except Exception as exc:
+        print("OCI Models fetch error:", exc)
+        return [(f"Error loading Oracle models: {exc}", "")]
+
+def fetch_ollama_models():
+    try:
+        resp = requests.get(f"{API_ROOT}/models/ollama", auth=SESS.auth, timeout=15)
+        data = resp.json() if resp.ok else []
+        if isinstance(data, list):
+            return [(m, m) for m in data]
+        return []
+    except Exception:
+        return []
+
+def format_context_sources(chunks, chunk_metadata):
+    if not chunks:
+        return "<div style='color:grey;padding:.5em'>No sources/chunks found for this question.</div>"
+    out = "<div style='display:flex;flex-direction:column;gap:1em;'>"
+    for idx, text in enumerate(chunks):
+        meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
+        citation = meta.get("citation") or meta.get("url") or "?"
+        url = meta.get("url")
+        url_part = f'<a href="{url}" target="_blank">{html.escape(str(citation))}</a>' if url else html.escape(str(citation))
+        t = html.escape(text[:700])
+        out += f"""
+        <div style='border-radius:9px;border:1.5px solid #ececec;padding:10px 13px;background:#fafdff;margin-bottom:4px;font-size:1em'>
+            <div style='font-weight:bold;margin-bottom:.1em'>{url_part}</div>
+            <div style='margin: 6px 0 4px 0;line-height:1.54;'>{t}{'...' if len(text)>700 else ''}</div>
+        </div>
+        """
+    out += "</div>"
+    return out
+
+def hybrid_search_fn(query, top_k, alpha):
+    reranker_model = "mxbai-rerank-xsmall"
+    try:
+        resp = requests.post(
+            f"{API_ROOT}/search/hybrid",
+            json={"query": query, "top_k": top_k, "alpha": alpha, "reranker": reranker_model}, auth=SESS.auth, timeout=20
+        )
+        resp.raise_for_status()
+        hits = resp.json()
+    except Exception:
+        hits = []
+    return format_context_sources([h.get("text","") for h in hits], [h.get("chunk_metadata") or {} for h in hits])
+
+def vector_search_fn(query, top_k):
+    try:
+        resp = requests.post(
+            f"{API_ROOT}/search/vector",
+            json={"query": query, "top_k": top_k}, auth=SESS.auth, timeout=20
+        )
+        resp.raise_for_status()
+        hits = resp.json()
+    except Exception:
+        hits = []
+    out = "<ul>"
+    for idx, h in enumerate(hits, 1):
+        out += f"<li>{h.get('text','')[:150]}{'...' if len(h.get('text',''))>150 else ''}</li>"
+    out += "</ul>"
+    return out
+
+def rag_chatbot(question, llm_source, ollama_model, oci_model_info_json, rag_top_k):
+    if not question:
+        return "", "", ""
+    # Step 1: Hybrid search
+    try:
+        resp = requests.post(
+            f"{API_ROOT}/search/hybrid",
+            json={"query": question, "top_k": rag_top_k, "alpha": 0.5, "reranker": "mxbai-rerank-xsmall"}, 
+            auth=SESS.auth, timeout=30
+        )
+        resp.raise_for_status()
+        hits = resp.json()
+        context_chunks = [h.get("text", "") for h in hits]
+        sources = [h.get("citation") or ((h.get("chunk_metadata") or {}).get("url") if (h.get("chunk_metadata") or {}) else "?") for h in hits]
+        chunk_metadata = [h.get("chunk_metadata") or {} for h in hits]
+    except Exception:
+        context_chunks, sources, chunk_metadata = [], [], []
+    answer, srcs_md = "", ""
+    if llm_source == "OCI GenAI":
+        oci_region = os.environ.get("OCI_REGION", "ap-sydney-1")
+        try:
+            model_info = json.loads(oci_model_info_json) if oci_model_info_json else {}
+        except Exception:
+            model_info = {}
+        model_id = model_info.get("id") or model_info.get("ocid") or model_info.get("model_id") or os.environ.get("OCI_GENAI_MODEL_OCID", "")
+        oci_payload = {
+            "model_info": model_info,
+            "oci_config": {
+                "compartment_id": os.environ.get("OCI_COMPARTMENT_OCID", ""),
+                "model_id": model_id,
+                "region": oci_region
+            },
+            "question": question,
+            "context_chunks": context_chunks or [],
+            "sources": sources or [],
+            "chunk_metadata": chunk_metadata or [],
+            "custom_prompt": LEGAL_SYSTEM_PROMPT,
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_tokens": 1024,
+            "repeat_penalty": 1.1
+        }
+        try:
+            r_oci = requests.post(f"{API_ROOT}/search/oci_rag", json=oci_payload, auth=SESS.auth, timeout=50)
+            oci_data = r_oci.json() if r_oci.ok else {}
+            answer = oci_data.get("answer", "")
+            if answer and "does not support TextGeneration" in answer:
+                answer += "<br><span style='color:#c42;font-size:1.03em;'>This OCI model does not support text generation. Make sure you select a model marked as LLM/TextGeneration and check Oracle Console.</span>"
+        except Exception as e:
+            answer = f"Error querying OCI GenAI: {e}"
+    else:
+        rag_payload = {
+            "question": question,
+            "context_chunks": context_chunks or [],
+            "sources": sources or [],
+            "chunk_metadata": chunk_metadata or [],
+            "custom_prompt": LEGAL_SYSTEM_PROMPT,
+            "model": ollama_model or "llama3",
+            "reranker_model": "mxbai-rerank-xsmall",
+            "top_k": rag_top_k
+        }
+        try:
+            r = requests.post(f"{API_ROOT}/search/rag", json=rag_payload, auth=SESS.auth, timeout=35)
+            rag_data = r.json() if r.ok else {}
+            answer = rag_data.get("answer", "")
+        except Exception as e:
+            answer = f"Error querying Ollama: {e}"
+    answer_html = f"<div style='color:#10890b;font-size:1.1em;font-family:Menlo,Monaco,monospace;margin-top:0.7em;white-space:pre-wrap'>{answer or '[No answer returned]'}"
+    answer_html += "</div>"
+    context_html = format_context_sources(context_chunks, chunk_metadata)
+    return answer_html, context_html, sources
+
+with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
 #llm-answer-box {
     color: #10890b !important;
     font-size: 1.13em;
@@ -275,7 +220,7 @@ with gr.Blocks(title="AUSLegalSearch Gradio Minimalist UX", css="""
     min-height: 32px;
 }
 """) as demo:
-    gr.Markdown("# AUSLegalSearch Gradio Minimalist Search & Chat")
+    gr.Markdown("# AUSLegalSearch RAG Platform")
 
     login_box = gr.Row(visible=True)
     with login_box:
@@ -285,60 +230,49 @@ with gr.Blocks(title="AUSLegalSearch Gradio Minimalist UX", css="""
         login_err = gr.Markdown("")
         login_btn = gr.Button("Login")
 
-    app_panel = gr.Row(visible=False)
-    with app_panel:
+    with gr.Row(visible=False) as app_panel:
         with gr.Tabs():
             with gr.Tab("Hybrid Search"):
                 hybrid_query = gr.Textbox(label="Enter a legal research question", lines=2)
                 hybrid_top_k = gr.Number(label="Top K Results", value=10, precision=0)
                 hybrid_alpha = gr.Slider(label="Hybrid weighting (semantic/keyword)", value=0.5, minimum=0.0, maximum=1.0)
-                hybrid_system_prompt = gr.Textbox(label="System Prompt", value=LEGAL_SYSTEM_PROMPT, lines=3)
-                hybrid_llm_model = gr.Dropdown(label="LLM model", choices=[], value="", allow_custom_value=True)
-                hybrid_reranker_model = gr.Dropdown(label="Reranker Model", choices=[], value="", allow_custom_value=True)
-                hybrid_btn = gr.Button("Hybrid Search & Legal RAG")
+                hybrid_btn = gr.Button("Hybrid Search")
                 hybrid_results = gr.HTML(label="Results", value="", show_label=False)
-                hybrid_answer = gr.HTML(label="LLM RAG Answer", elem_id="llm-answer-box", value="")
-                hybrid_sources = gr.HTML(label="Citations", value="", show_label=False)
                 hybrid_btn.click(
                     hybrid_search_fn,
-                    inputs=[hybrid_query, hybrid_top_k, hybrid_alpha, hybrid_system_prompt, hybrid_llm_model, hybrid_reranker_model],
-                    outputs=[hybrid_results, hybrid_answer, hybrid_sources]
+                    inputs=[hybrid_query, hybrid_top_k, hybrid_alpha],
+                    outputs=[hybrid_results]
                 )
-
             with gr.Tab("Vector Search"):
                 vector_query = gr.Textbox(label="Vector Search Query", lines=2)
                 vector_top_k = gr.Number(label="Top K Results", value=10, precision=0)
-                vector_llm_model = gr.Dropdown(label="LLM model", choices=[], value="", allow_custom_value=True)
-                vector_reranker_model = gr.Dropdown(label="Reranker Model", choices=[], value="", allow_custom_value=True)
                 vector_btn = gr.Button("Run Vector Search")
                 vector_results = gr.HTML(label="Result cards", value="", show_label=False)
                 vector_btn.click(
                     vector_search_fn,
-                    inputs=[vector_query, vector_top_k, vector_reranker_model, vector_llm_model],
+                    inputs=[vector_query, vector_top_k],
                     outputs=[vector_results]
                 )
-
-            with gr.Tab("Chat"):
-                chat_llm_model = gr.Dropdown(label="LLM model", choices=[], value="", allow_custom_value=True)
-                chat_reranker_model = gr.Dropdown(label="Reranker Model", choices=[], value="", allow_custom_value=True)
-                chat_top_k = gr.Number(label="Top K Chunks", value=10, precision=0)
-                temperature = gr.Slider(label="Temperature", value=0.1, minimum=0, maximum=1, step=0.01)
-                top_p = gr.Slider(label="Top-p", value=0.95, minimum=0, maximum=1, step=0.01)
-                max_tokens = gr.Number(label="Max Tokens", value=1024, precision=0)
-                repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.8, maximum=2.0, step=0.01)
-                chatbot = gr.Chatbot(label="Legal Chat – minimalist", type="messages", show_label=False)
-                chat_input = gr.Textbox(show_label=False, placeholder="Ask about a legal topic...", lines=2)
-                send_btn = gr.Button("Send")
-                chat_citations = gr.HTML(label="Sources", value="", show_label=False)
-                def chat_wrapper(user_msg, history, chat_top_k, temperature, top_p, max_tokens, repeat_penalty, chat_llm_model, chat_reranker_model):
-                    updated_hist, chat_srcs, clear_input = chat_tab_fn(
-                        user_msg, history, chat_top_k, temperature, top_p, max_tokens, repeat_penalty, chat_llm_model, chat_reranker_model)
-                    return updated_hist, chat_srcs, clear_input
-                chat_state = gr.State([])
-                send_btn.click(
-                    chat_wrapper,
-                    inputs=[chat_input, chatbot, chat_top_k, temperature, top_p, max_tokens, repeat_penalty, chat_llm_model, chat_reranker_model],
-                    outputs=[chatbot, chat_citations, chat_input]
+            with gr.Tab("RAG"):
+                gr.Markdown("#### RAG-Powered Legal Chat")
+                llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
+                ollama_model = gr.Dropdown(label="Ollama Model", choices=[], visible=True)
+                oci_model = gr.Dropdown(label="OCI GenAI Model", choices=[], visible=False)
+                rag_top_k = gr.Number(label="Top K Context Chunks", value=10, precision=0)
+                def update_model_dropdowns(src):
+                    if src == "OCI GenAI":
+                        return gr.update(visible=False), gr.update(choices=fetch_oci_models(), visible=True)
+                    else:
+                        return gr.update(choices=fetch_ollama_models(), visible=True), gr.update(choices=[], visible=False)
+                llm_source.change(update_model_dropdowns, inputs=[llm_source], outputs=[ollama_model, oci_model])
+                question = gr.Textbox(label="Enter your legal or compliance question", lines=2)
+                ask_btn = gr.Button("Ask")
+                answer = gr.HTML(label="Answer", elem_id="llm-answer-box", value="")
+                context = gr.HTML(label="Context / Sources", value="", show_label=False)
+                ask_btn.click(
+                    rag_chatbot,
+                    inputs=[question, llm_source, ollama_model, oci_model, rag_top_k],
+                    outputs=[answer, context, gr.State()]
                 )
 
     login_btn.click(
@@ -349,12 +283,6 @@ with gr.Blocks(title="AUSLegalSearch Gradio Minimalist UX", css="""
             app_panel,
             login_err,
             login_err,
-            hybrid_llm_model,
-            hybrid_reranker_model,
-            vector_llm_model,
-            vector_reranker_model,
-            chat_llm_model,
-            chat_reranker_model
         ]
     )
 
