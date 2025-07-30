@@ -46,6 +46,7 @@
 
 ### Agentic RAG Chain-of-Thought Workflow
 
+<img width="2000" height="12600" alt="image" src="https://github.com/user-attachments/assets/05148d8c-1327-47da-99ee-5c4e6421e7f8" />
 
 
 ---
