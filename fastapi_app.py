@@ -279,6 +279,96 @@ def api_search_oci_rag(req: OCIRagReq, _: str = Depends(get_current_user)):
         chat_history=req.chat_history,
     )
 
+# --- Conversational Chat endpoint ---
+class ChatConversationReq(BaseModel):
+    llm_source: str  # "ollama" or "oci_genai"
+    model: Optional[str] = None
+    message: str
+    chat_history: Optional[list] = None
+    system_prompt: Optional[str] = None
+    temperature: Optional[float] = 0.1
+    top_p: Optional[float] = 0.9
+    max_tokens: Optional[int] = 1024
+    repeat_penalty: Optional[float] = 1.1
+    # oci config, if applicable
+    oci_config: Optional[Dict[str, Any]] = None
+
+@app.post("/chat/conversation", tags=["chat"])
+def api_conversational_chat(req: ChatConversationReq, _: str = Depends(get_current_user)):
+    """
+    Conversational endpoint with Top K vector search + context injection.
+    For each turn: runs hybrid search using message, passes results to LLM (Ollama or OCI GenAI), returns both answer and sources/cards for UI display.
+    """
+    history = req.chat_history or []
+    system_prompt = req.system_prompt
+
+    # Legal-focused default prompt
+    LEGAL_ASSISTANT_PROMPT = (
+        "You are an expert Australian legal research and compliance AI assistant. "
+        "Answer strictly from the provided sources and context. Always cite the source section/citation for every statement. "
+        "If you do not know the answer from the context, reply: 'Not found in the provided legal documents.' "
+        "Be neutral, factual, and never invent legal advice."
+    )
+    custom_prompt = system_prompt or LEGAL_ASSISTANT_PROMPT
+
+    # New: Per-turn hybrid search for Top K context
+    from db.store import search_hybrid
+    top_k = getattr(req, "top_k", 10)
+    hybrid_hits = search_hybrid(req.message, top_k=top_k, alpha=0.5)
+    context_chunks = [h.get("text", "") for h in hybrid_hits]
+    sources = [h.get("citation") or ((h.get("chunk_metadata") or {}).get("url") if (h.get("chunk_metadata") or {}) else "?") for h in hybrid_hits]
+    chunk_metadata = [h.get("chunk_metadata") or {} for h in hybrid_hits]
+
+    out = {}
+    if req.llm_source.lower() == "ollama":
+        rag = RAGPipeline(model=req.model or "llama3")
+        llm_resp = rag.query(
+            req.message,
+            chat_history=history,
+            context_chunks=context_chunks,
+            sources=sources,
+            chunk_metadata=chunk_metadata,
+            custom_prompt=custom_prompt,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            max_tokens=req.max_tokens,
+            repeat_penalty=req.repeat_penalty
+        )
+        out["answer"] = llm_resp.get("answer", "")
+        out["sources"] = sources
+        out["chunk_metadata"] = chunk_metadata
+        out["context_chunks"] = context_chunks
+    elif req.llm_source.lower() == "oci_genai":
+        config = req.oci_config or {}
+        compartment_id = config.get("compartment_id") or os.environ.get("OCI_COMPARTMENT_OCID", "")
+        model_id = config.get("model_id") or os.environ.get("OCI_GENAI_MODEL_OCID", "")
+        region = config.get("region") or os.environ.get("OCI_REGION", "ap-sydney-1")
+        pipeline = OCIGenAIPipeline(
+            compartment_id=compartment_id,
+            model_id=model_id,
+            region=region
+        )
+        llm_resp = pipeline.query(
+            question=req.message,
+            chat_history=history,
+            context_chunks=context_chunks,
+            sources=sources,
+            chunk_metadata=chunk_metadata,
+            custom_prompt=custom_prompt,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            max_tokens=req.max_tokens,
+            repeat_penalty=req.repeat_penalty
+        )
+        out["answer"] = llm_resp.get("answer", "")
+        out["sources"] = sources
+        out["chunk_metadata"] = chunk_metadata
+        out["context_chunks"] = context_chunks
+    else:
+        raise HTTPException(400, f"Unknown llm_source {req.llm_source}")
+
+    return out
+
 # --- Chat Session endpoints ---
 class ChatMsg(BaseModel):
     prompt: str
@@ -400,7 +490,9 @@ def api_oci_genai_models(_: str = Depends(get_current_user)):
 
 @app.get("/models/ollama", tags=["models"])
 def api_ollama_models(_: str = Depends(get_current_user)):
-    return list_ollama_models()
+    models = list_ollama_models()
+    print("DEBUG: /models/ollama returned models:", models)
+    return models
 
 @app.get("/files/ls", tags=["files"])
 def api_ls(path: str, _: str = Depends(get_current_user)):
