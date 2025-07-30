@@ -1,4 +1,11 @@
 #!/bin/bash
+# Source environment variables from .env if present
+if [ -f .env ]; then
+  echo "Sourcing .env for environment variables..."
+  set -o allexport
+  source .env
+  set +o allexport
+fi
 
 # Start FastAPI backend (Uvicorn) in background (old port: 8000)
 uvicorn fastapi_app:app --host 0.0.0.0 --port 8000 &
