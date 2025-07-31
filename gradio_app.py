@@ -518,6 +518,7 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                     inputs=[hybrid_query, hybrid_top_k, hybrid_alpha],
                     outputs=[hybrid_results]
                 )
+            """
             with gr.Tab("Vector Search"):
                 vector_query = gr.Textbox(label="Vector Search Query", lines=2)
                 vector_top_k = gr.Number(label="Top K Results", value=10, precision=0)
@@ -528,6 +529,7 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                     inputs=[vector_query, vector_top_k],
                     outputs=[vector_results]
                 )
+                """
             with gr.Tab("RAG"):
                 gr.Markdown("#### RAG-Powered Legal Chat")
                 llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
@@ -560,6 +562,7 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                     inputs=[question, llm_source, ollama_model, oci_model, rag_top_k, system_prompt, temperature, top_p, max_tokens, repeat_penalty],
                     outputs=[answer, context, gr.State()]
                 )
+                """
             with gr.Tab("Conversational Chat"):
                 gr.Markdown("#### Conversational Chatbot (RAG-style: each turn uses Top K hybrid search for context, sources shown as cards)")
                 chat_llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
@@ -606,7 +609,8 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                             chat_top_k, chat_history, chat_system_prompt, chat_temperature, chat_top_p, chat_max_tokens, chat_repeat_penalty],
                     outputs=[conversation_html, chat_history]
                 )
-            with gr.Tab("Agentic Chat"):
+                """
+            with gr.Tab("Agentic RAG"):
                 gr.Markdown("#### Agentic RAG/Chain-of-Thought Chat (Ollama and OCI GenAI)")
                 agent_llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
                 agent_ollama_model = gr.Dropdown(label="Ollama Model", choices=[], visible=True)
