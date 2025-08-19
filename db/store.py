@@ -91,7 +91,77 @@ class ConversionFile(Base):
     error_message = Column(Text, nullable=True)
 
 def create_all_tables():
+    # Enable vital extensions (in superuser context if allowed)
+    exts = [
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"",
+        "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch",
+    ]
+    with engine.begin() as conn:
+        for ddl in exts:
+            try:
+                conn.execute(text(ddl))
+            except Exception as e:
+                print(f"[EXT NOTE] Could not enable extension: {ddl}\nReason: {e}")
+
     Base.metadata.create_all(engine)
+    # --- Post-table DDL: create indexes, triggers, and FTS structures if missing ---
+    ddl_sql = [
+        # 1. Add document_fts if missing
+        """
+        ALTER TABLE public.documents
+        ADD COLUMN IF NOT EXISTS document_fts tsvector
+        """,
+        # 2. Populate document_fts
+        """
+        UPDATE public.documents
+        SET document_fts = to_tsvector('english', coalesce(content, ''))
+        WHERE document_fts IS NULL
+        """,
+        # 3. GIN FTS index for document_fts
+        """
+        CREATE INDEX IF NOT EXISTS idx_documents_fts
+        ON public.documents USING GIN (document_fts)
+        """,
+        # 4. Trigram content index
+        """
+        CREATE INDEX IF NOT EXISTS idx_documents_content_trgm
+        ON public.documents USING GIN (content gin_trgm_ops)
+        """,
+        # 5. Trigger function for updating document_fts
+        """
+        CREATE OR REPLACE FUNCTION documents_fts_trigger() RETURNS trigger AS $$
+        BEGIN
+          NEW.document_fts := to_tsvector('english', coalesce(NEW.content, ''));
+          RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql;
+        """,
+        # 6. Drop old trigger if exists for safety, then create
+        """
+        DROP TRIGGER IF EXISTS tsvectorupdate ON public.documents
+        """,
+        """
+        CREATE TRIGGER tsvectorupdate
+        BEFORE INSERT OR UPDATE ON public.documents
+        FOR EACH ROW EXECUTE FUNCTION documents_fts_trigger()
+        """,
+        # 7. IVFFLAT vector index for cosine on embeddings
+        """
+        CREATE INDEX IF NOT EXISTS idx_embeddings_vector_ivfflat_cosine
+        ON public.embeddings USING ivfflat (vector vector_cosine_ops)
+        WITH (lists = 100)
+        """,
+    ]
+    # Force psql to continue on error for objects already existing
+    with engine.begin() as conn:
+        for ddl in ddl_sql:
+            try:
+                conn.execute(text(ddl))
+            except Exception as e:
+                print(f"[DDL NOTE] Could not execute:\n{ddl}\nReason: {e}")
+
 
 # --- User CRUD and Auth logic ---
 def hash_password(password: str) -> str:
