@@ -1,11 +1,11 @@
 """
-Loader for auslegalsearchv3: Strictest Chunking for Embedding
-- If any chunk (even after paragraph chunking) >1000 chars, further splits chunk at sentence/end boundary or substring.
-- Guarantees every chunk ≤1000 characters, even for very long paragraphs.
+Loader for auslegalsearchv3: Nomic 768D Embedding, 1500-char Chunking
+- All legal/journal/case/generic chunking uses ~1500-char target.
+- If any chunk >1500 chars after paragraph chunking, further split chunk at sentence/end boundary or substring.
 
 Chunking rules:
-- Prefer not to split paragraphs, but will split internally if a single paragraph exceeds 1000 chars
-- Target ~850 chars, min 150 per chunk
+- Prefer not to split paragraphs, but will split internally if a single paragraph chunk exceeds 1500 chars.
+- Absolute guarantee: every chunk ≤1500 characters.
 """
 
 import os
@@ -89,7 +89,7 @@ def parse_html(filepath: str) -> dict:
         print(f"Error parsing HTML {filepath}: {e}")
         return {}
 
-def split_chunk_hard(chunk: str, max_length: int = 1000) -> list:
+def split_chunk_hard(chunk: str, max_length: int = 1500) -> list:
     """If any chunk > max_length, break it up further—prefer periods, else break every max_length."""
     if len(chunk) <= max_length:
         return [chunk]
@@ -103,7 +103,6 @@ def split_chunk_hard(chunk: str, max_length: int = 1000) -> list:
             if current:
                 out.append(current.strip())
             if len(sent) > max_length:
-                # If an individual sentence is too long, break up hard
                 for i in range(0, len(sent), max_length):
                     out.append(sent[i : i + max_length].strip())
                 current = ""
@@ -113,7 +112,7 @@ def split_chunk_hard(chunk: str, max_length: int = 1000) -> list:
         out.append(current.strip())
     return out
 
-def chunk_by_paragraphs(text: str, target_chars: int = 850) -> list[str]:
+def chunk_by_paragraphs(text: str, target_chars: int = 1500) -> list[str]:
     paras = [p for p in re.split(r'(?:\r?\n){2,}', text) if p.strip()]
     chunks = []
     current_chunk = ""
@@ -127,10 +126,10 @@ def chunk_by_paragraphs(text: str, target_chars: int = 850) -> list[str]:
             current_chunk = para.strip()
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
-    # HARD SPLIT step: if any chunk > 1000 chars, break up at sentence/end
+    # HARD SPLIT step: if any chunk > 1500 chars, break up at sentence/end
     final = []
     for chunk in chunks:
-        final.extend(split_chunk_hard(chunk, max_length=1000))
+        final.extend(split_chunk_hard(chunk, max_length=1500))
     return final
 
 def chunk_legislation(doc: dict, min_chunk_length: int = 150) -> list[dict]:
@@ -147,7 +146,7 @@ def chunk_legislation(doc: dict, min_chunk_length: int = 150) -> list[dict]:
         sec_num = match.group(1).strip()
         sec_title = match.group(2).strip()
         sec_text = match.group(3).strip()
-        for subchunk in chunk_by_paragraphs(sec_text, target_chars=850):
+        for subchunk in chunk_by_paragraphs(sec_text, target_chars=1500):
             if len(subchunk.strip()) >= min_chunk_length:
                 section_meta = {**meta, "section": sec_num, "section_title": sec_title, "section_idx": idx}
                 sections.append({
@@ -157,9 +156,9 @@ def chunk_legislation(doc: dict, min_chunk_length: int = 150) -> list[dict]:
                     "chunk_metadata": section_meta,
                     "legal_section": sec_title or sec_num,
                 })
-    # Fallback: If any chunk >1000 chars, or if no chunks, do paragraph chunking (with hard split) for the whole doc
-    if not sections or any(len(chunk['text']) > 1000 for chunk in sections):
-        para_chunks = chunk_by_paragraphs(text, target_chars=850)
+    # Fallback: If any chunk >1500 chars, or if no chunks, do paragraph chunking (with hard split) for the whole doc
+    if not sections or any(len(chunk['text']) > 1500 for chunk in sections):
+        para_chunks = chunk_by_paragraphs(text, target_chars=1500)
         out = []
         for idx, ch in enumerate(para_chunks):
             if len(ch.strip()) >= min_chunk_length:
@@ -205,9 +204,9 @@ def chunk_journal(doc: dict, min_chunk_length: int = 150) -> list[dict]:
             "chunk_metadata": meta,
             "legal_section": last_heading,
         })
-    # Force fallback if any chunk >1000 chars, or if no chunks
-    if not chunks or any(len(chunk['text']) > 1000 for chunk in chunks):
-        para_chunks = chunk_by_paragraphs(text, target_chars=850)
+    # Force fallback if any chunk >1500 chars, or if no chunks
+    if not chunks or any(len(chunk['text']) > 1500 for chunk in chunks):
+        para_chunks = chunk_by_paragraphs(text, target_chars=1500)
         out = []
         for idx, ch in enumerate(para_chunks):
             if len(ch.strip()) >= min_chunk_length:
@@ -225,7 +224,7 @@ def chunk_case(doc: dict, min_chunk_length: int = 150) -> list[dict]:
     meta = doc.get("chunk_metadata", {})
     srcpath = doc.get("source", "")
     text = doc.get("text", "")
-    para_chunks = chunk_by_paragraphs(text, target_chars=850)
+    para_chunks = chunk_by_paragraphs(text, target_chars=1500)
     chunks = []
     for idx, para in enumerate(para_chunks):
         if len(para.strip()) >= min_chunk_length:
@@ -237,9 +236,9 @@ def chunk_case(doc: dict, min_chunk_length: int = 150) -> list[dict]:
                 "chunk_metadata": section_meta,
                 "legal_section": meta.get("title", f"para_{idx}")
             })
-    # Fallback: If any chunk >1000 chars or no chunks
-    if not chunks or any(len(chunk['text']) > 1000 for chunk in chunks):
-        para_chunks_fallback = chunk_by_paragraphs(text, target_chars=850)
+    # Fallback: If any chunk >1500 chars or no chunks
+    if not chunks or any(len(chunk['text']) > 1500 for chunk in chunks):
+        para_chunks_fallback = chunk_by_paragraphs(text, target_chars=1500)
         out = []
         for idx, ch in enumerate(para_chunks_fallback):
             if len(ch.strip()) >= min_chunk_length:
@@ -253,14 +252,14 @@ def chunk_case(doc: dict, min_chunk_length: int = 150) -> list[dict]:
         return out
     return chunks
 
-def chunk_generic(doc: dict, min_chunk_length: int = 50, target_chars: int = 850) -> list[dict]:
+def chunk_generic(doc: dict, min_chunk_length: int = 50, target_chars: int = 1500) -> list[dict]:
     meta = doc.get("chunk_metadata", {})
     srcpath = doc.get("source", "")
     text = doc.get("text", "")
     para_chunks = chunk_by_paragraphs(text, target_chars=target_chars)
     out_chunks = []
     for idx, ch in enumerate(para_chunks):
-        subchunks = split_chunk_hard(ch, max_length=1000)
+        subchunks = split_chunk_hard(ch, max_length=1500)
         for subidx, sch in enumerate(subchunks):
             if len(sch.strip()) >= min_chunk_length:
                 out_chunks.append({
@@ -272,7 +271,7 @@ def chunk_generic(doc: dict, min_chunk_length: int = 50, target_chars: int = 850
                 })
     return out_chunks
 
-def chunk_document(doc: dict, chunk_size: int = 850, overlap: int = 200) -> list[dict]:
+def chunk_document(doc: dict, chunk_size: int = 1500, overlap: int = 200) -> list[dict]:
     dtype = (doc.get("format") or "").strip().lower()
     if dtype == "legislation":
         chunks = chunk_legislation(doc)
@@ -286,7 +285,7 @@ def chunk_document(doc: dict, chunk_size: int = 850, overlap: int = 200) -> list
         chunks = chunk_case(doc)
         if chunks:
             return chunks
-    return chunk_generic(doc, min_chunk_length=50, target_chars=850)
+    return chunk_generic(doc, min_chunk_length=50, target_chars=1500)
 
 def embed_chunk(chunk: dict) -> dict:
     try:
