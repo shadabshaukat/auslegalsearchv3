@@ -373,6 +373,99 @@ def update_conversion_file_status(cf_id, status, error_message=None, success=Non
         session.commit()
         return cf
 
+def search_fts(query, top_k=10, mode="both"):
+    """
+    Full text search over 'document_fts' of documents and/or embeddings.chunk_metadata (jsonb as text).
+    mode: "documents", "metadata", or "both"
+    Deduplicates by metadata URL (if present), else doc_id/source, to return unique cases only.
+    """
+    import json as _jsonmod
+    def extract_url(md):
+        """Extracts URL from stringified or dict metadata, or returns None."""
+        if not md:
+            return None
+        if isinstance(md, dict):
+            return md.get("url")
+        try:
+            mdict = _jsonmod.loads(md) if isinstance(md, str) else md
+            return mdict.get("url")
+        except Exception:
+            return None
+
+    with SessionLocal() as session:
+        all_hits = []
+        seen_keys = set()
+
+        if mode in ("documents", "both"):
+            doc_sql = """
+            SELECT id as doc_id, NULL as chunk_index,
+                source, content, NULL as chunk_text,
+                NULL as chunk_metadata,
+                ts_headline('english', content, q, 'StartSel=<b>, StopSel=</b>') as snippet
+            FROM documents, plainto_tsquery('english', :q) q
+            WHERE document_fts @@ q
+            LIMIT :topk
+            """
+            doc_hits = session.execute(text(doc_sql), {"q": query, "topk": top_k*8}).fetchall()
+            for row in doc_hits:
+                hit = {
+                    "doc_id": row[0],
+                    "chunk_index": row[1],
+                    "source": row[2],
+                    "content": row[3],
+                    "text": row[4] if row[4] else row[3],
+                    "chunk_metadata": row[5],
+                    "snippet": row[6],
+                    "search_area": "documents"
+                }
+                url = extract_url(row[5])
+                hit["dedup_key"] = url if url else ("doc", row[0])
+                all_hits.append(hit)
+
+        if mode in ("metadata", "both"):
+            chunk_sql = """
+            SELECT e.doc_id, e.chunk_index, d.source, d.content,
+                NULL as snippet,
+                e.chunk_metadata::text as chunk_metadata,
+                ts_headline('english', e.chunk_metadata::text, q, 'StartSel=<b>, StopSel=</b>') as chunk_snippet
+            FROM embeddings e
+            JOIN documents d ON e.doc_id = d.id,
+                 plainto_tsquery('english', :q) q
+            WHERE to_tsvector('english', e.chunk_metadata::text) @@ q
+            LIMIT :topk
+            """
+            chunk_hits = session.execute(text(chunk_sql), {"q": query, "topk": top_k*8}).fetchall()
+            for row in chunk_hits:
+                hit = {
+                    "doc_id": row[0],
+                    "chunk_index": row[1],
+                    "source": row[2],
+                    "content": row[3],
+                    "text": row[5],
+                    "chunk_metadata": row[5],
+                    "snippet": row[6],
+                    "search_area": "metadata"
+                }
+                url = extract_url(row[5])
+                hit["dedup_key"] = url if url else ("doc", row[0])
+                all_hits.append(hit)
+
+        # Group by dedup_key (url or doc_id) and select the "best" (lowest chunk_index/first) per group
+        grouped = {}
+        for h in all_hits:
+            key = h.get("dedup_key")
+            if key not in grouped:
+                grouped[key] = h
+            else:
+                # If metadata, prefer chunk_index==0; else keep first seen
+                if h["search_area"] == "metadata" and grouped[key]["search_area"] == "metadata":
+                    if h.get("chunk_index", 9999) < grouped[key].get("chunk_index", 9999):
+                        grouped[key] = h
+
+        unique_hits = list(grouped.values())
+        # Optionally, rank: for now keep order, but slice to top_k
+        return unique_hits[:top_k]
+
 create_all_tables()
 
 __all__ = [

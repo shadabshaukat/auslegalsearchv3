@@ -22,7 +22,7 @@ from db.store import (
     create_user, get_user_by_email, hash_password, check_password,
     add_document, add_embedding, start_session, get_session, complete_session, fail_session, update_session_progress,
     search_vector, search_bm25, search_hybrid, get_chat_session, save_chat_session,
-    get_active_sessions, get_resume_sessions,
+    get_active_sessions, get_resume_sessions, search_fts
 )
 from embedding.embedder import Embedder
 from rag.rag_pipeline import RAGPipeline, list_ollama_models
@@ -497,6 +497,20 @@ def api_oracle23ai_query(req: Oracle23aiQueryReq, _: str = Depends(get_current_u
         return results
     finally:
         connector.close()
+
+# --- Full Text Search endpoint ---
+class FtsSearchReq(BaseModel):
+    query: str
+    top_k: int = 10
+    mode: str = "both"  # "documents", "metadata", "both"
+
+@app.post("/search/fts", tags=["search"])
+def api_search_fts(req: FtsSearchReq, _: str = Depends(get_current_user)):
+    """
+    Full text search using stemming and phrase logic over document_fts (in documents),
+    chunk_metadata (in embeddings), or both, as chosen by 'mode' param.
+    """
+    return search_fts(req.query, req.top_k, req.mode)
 
 # --- Utility/model endpoints ---
 @app.get("/models/oci_genai", tags=["models"])

@@ -375,6 +375,33 @@ def agentic_chat_fn(message, llm_source, ollama_model, oci_model_info_json, top_
         return html_out or "<i>No conversation yet.</i>"
     return render_history(chat_history), chat_history
 
+def fts_search_fn(query, top_k):
+    try:
+        resp = requests.post(
+            f"{API_ROOT}/search/fts",
+            json={"query": query, "top_k": int(top_k)},
+            auth=SESS.auth,
+            timeout=15
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    except Exception as e:
+        return f"<div style='color:#c22'>FTS Error: {e}</div>"
+    if not results:
+        return "<div style='color:#888;'><i>No matches found.</i></div>"
+    out = ""
+    for hit in results:
+        out += f"""
+        <div class="fts-result-card" style="border:1.1px solid #ccd; border-radius:7px; padding:9px 14px; margin:12px 0;">
+          <div><span style="color:#296b8b;font-weight:bold">Source:</span> <span>{html.escape(str(hit.get('source','')))}</span></div>
+          <div><span style="color:#1d6842;font-weight:bold">Snippet:</span> <span>{hit.get('snippet','')}</span></div>
+          <div><span style="color:#333;font-size:90%;">Doc ID: {hit.get('doc_id','')}</span>
+          {'| Chunk Index: '+str(hit.get('chunk_index','')) if hit.get('chunk_index') is not None else ''}</div>
+          {f"<div style='color:#aaa;font-size:90%;margin-top:3px;'><b>Metadata:</b> {html.escape(str(hit.get('chunk_metadata','') or ''))}</div>" if hit.get('chunk_metadata') else ""}
+        </div>
+        """
+    return out
+
 with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
 #llm-answer-box {
     color: #10890b !important;
@@ -518,51 +545,89 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                     inputs=[hybrid_query, hybrid_top_k, hybrid_alpha],
                     outputs=[hybrid_results]
                 )
-            """
-            with gr.Tab("Vector Search"):
-                vector_query = gr.Textbox(label="Vector Search Query", lines=2)
-                vector_top_k = gr.Number(label="Top K Results", value=10, precision=0)
-                vector_btn = gr.Button("Run Vector Search")
-                vector_results = gr.HTML(label="Result cards", value="", show_label=False)
-                vector_btn.click(
-                    vector_search_fn,
-                    inputs=[vector_query, vector_top_k],
-                    outputs=[vector_results]
-                )
-                """
             with gr.Tab("RAG"):
                 gr.Markdown("#### RAG-Powered Legal Chat")
-                llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
-                ollama_model = gr.Dropdown(label="Ollama Model", choices=[], visible=True)
-                oci_model = gr.Dropdown(label="OCI GenAI Model", choices=[], visible=False)
-                rag_top_k = gr.Number(label="Top K Context Chunks", value=10, precision=0)
-                system_prompt = gr.Textbox(label="System Prompt", value=DEFAULT_SYSTEM_PROMPT, lines=3)
-                temperature = gr.Slider(label="Temperature", value=0.1, minimum=0.0, maximum=1.5, step=0.01)
-                top_p = gr.Slider(label="Top P", value=0.9, minimum=0.0, maximum=1.0, step=0.01)
-                max_tokens = gr.Number(label="Max Tokens", value=1024, precision=0)
-                repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.5, maximum=2.0, step=0.01)
-                def update_model_dropdowns(src):
+                rag_llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
+                rag_ollama_model = gr.Dropdown(label="Ollama Model", choices=[], visible=True)
+                rag_oci_model = gr.Dropdown(label="OCI GenAI Model", choices=[], visible=False)
+                def update_rag_model_dropdowns_hide_oci(src):
                     if src == "OCI GenAI":
-                        return (
-                            gr.update(visible=False),
-                            gr.update(choices=fetch_oci_models(), visible=True)
-                        )
+                        return gr.update(visible=False), gr.update(visible=False)
                     else:
-                        return (
-                            gr.update(choices=fetch_ollama_models(), visible=True),
-                            gr.update(choices=[], visible=False)
-                        )
-                llm_source.change(update_model_dropdowns, inputs=[llm_source], outputs=[ollama_model, oci_model])
-                question = gr.Textbox(label="Enter your legal or compliance question", lines=2)
-                ask_btn = gr.Button("Ask")
-                answer = gr.HTML(label="Answer", elem_id="llm-answer-box", value="")
-                context = gr.HTML(label="Context / Sources", value="", show_label=False)
-                ask_btn.click(
+                        return gr.update(choices=fetch_ollama_models(), visible=True), gr.update(choices=[], visible=False)
+                rag_llm_source.change(update_rag_model_dropdowns_hide_oci, inputs=[rag_llm_source], outputs=[rag_ollama_model, rag_oci_model])
+                rag_top_k = gr.Number(label="Top K Context Chunks", value=10, precision=0)
+                rag_system_prompt = gr.Textbox(label="System Prompt", value=DEFAULT_SYSTEM_PROMPT, lines=3)
+                rag_temperature = gr.Slider(label="Temperature", value=0.1, minimum=0.0, maximum=1.5, step=0.01)
+                rag_top_p = gr.Slider(label="Top P", value=0.9, minimum=0.0, maximum=1.0, step=0.01)
+                rag_max_tokens = gr.Number(label="Max Tokens", value=1024, precision=0)
+                rag_repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.5, maximum=2.0, step=0.01)
+                # (Removed old update_rag_model_dropdowns handler; only use update_rag_model_dropdowns_hide_oci above)
+                rag_question = gr.Textbox(label="Enter your legal or compliance question", lines=2)
+                rag_ask_btn = gr.Button("Ask")
+                rag_answer = gr.HTML(label="Answer", elem_id="llm-answer-box", value="")
+                rag_context = gr.HTML(label="Context / Sources", value="", show_label=False)
+                rag_ask_btn.click(
                     rag_chatbot,
-                    inputs=[question, llm_source, ollama_model, oci_model, rag_top_k, system_prompt, temperature, top_p, max_tokens, repeat_penalty],
-                    outputs=[answer, context, gr.State()]
+                    inputs=[rag_question, rag_llm_source, rag_ollama_model, rag_oci_model, rag_top_k, rag_system_prompt, rag_temperature, rag_top_p, rag_max_tokens, rag_repeat_penalty],
+                    outputs=[rag_answer, rag_context, gr.State()]
                 )
-                """
+            with gr.Tab("Full Text Search"):
+                gr.Markdown("**Full Text Search** &mdash; phrase and stemmed search across legal documents and/or all indexed metadata fields. Choose search area below.")
+                fts_q = gr.Textbox(label="Search Query", lines=2)
+                fts_top_k = gr.Number(label="Max Results", value=10, precision=0)
+                fts_mode = gr.Dropdown(
+                    label="Search in",
+                    choices=["Both", "Documents", "Chunk Metadata"],
+                    value="Both"
+                )
+                fts_btn = gr.Button("Full Text Search")
+                fts_results = gr.HTML(value="", show_label=False)
+                def fts_search_fn_user(q, k, mode):
+                    mode_map = {
+                        "Both": "both",
+                        "Documents": "documents",
+                        "Chunk Metadata": "metadata"
+                    }
+                    mode_val = mode_map.get(mode, "both")
+                    try:
+                        resp = requests.post(
+                            f"{API_ROOT}/search/fts",
+                            json={"query": q, "top_k": int(k), "mode": mode_val},
+                            auth=SESS.auth,
+                            timeout=15
+                        )
+                        resp.raise_for_status()
+                        results = resp.json()
+                    except Exception as e:
+                        return f"<div style='color:#c22'>FTS Error: {e}</div>"
+                    if not results:
+                        return "<div style='color:#888;'><i>No matches found.</i></div>"
+                    out = ""
+                    for hit in results:
+                        url = None
+                        meta = {}
+                        try:
+                            if hit.get('chunk_metadata'):
+                                meta = json.loads(hit.get('chunk_metadata',''))
+                        except Exception:
+                            meta = {}
+                        url = meta.get('url')
+                        if url:
+                            source_html = f'<a href="{html.escape(url)}" target="_blank">{html.escape(url)}</a>'
+                        else:
+                            source_html = html.escape(str(hit.get("source","")))
+                        out += f"""
+                        <div class="fts-result-card" style="border:1.1px solid #ccd; border-radius:7px; padding:9px 14px; margin:12px 0;">
+                          <div><span style="color:#296b8b;font-weight:bold">Source:</span> <span>{source_html}</span></div>
+                          <div><span style="color:#1d6842;font-weight:bold">Snippet:</span> <span>{hit.get('snippet','')}</span></div>
+                          <div><span style="color:#333;font-size:90%;">Doc ID: {hit.get('doc_id','')}</span>
+                          {'| Chunk Index: '+str(hit.get('chunk_index','')) if hit.get('chunk_index') is not None else ''}</div>
+                          {f"<div style='color:#aaa;font-size:90%;margin-top:3px;'><b>Metadata:</b> {html.escape(str(hit.get('chunk_metadata','') or ''))}</div>" if hit.get('chunk_metadata') else ""}
+                        </div>
+                        """
+                    return out
+                fts_btn.click(fts_search_fn_user, [fts_q, fts_top_k, fts_mode], [fts_results])
             with gr.Tab("Conversational Chat"):
                 gr.Markdown("#### Conversational Chatbot (RAG-style: each turn uses Top K hybrid search for context, sources shown as cards)")
                 chat_llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
@@ -575,18 +640,12 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                 chat_max_tokens = gr.Number(label="Max Tokens", value=1024, precision=0)
                 chat_repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.5, maximum=2.0, step=0.01)
                 chat_history = gr.State([])
-                def update_chat_model_dropdowns(src):
+                def update_chat_model_dropdowns_hide_oci(src):
                     if src == "OCI GenAI":
-                        return (
-                            gr.update(visible=False),
-                            gr.update(choices=fetch_oci_models(), visible=True)
-                        )
+                        return gr.update(visible=False), gr.update(visible=False)
                     else:
-                        return (
-                            gr.update(choices=fetch_ollama_models(), visible=True),
-                            gr.update(choices=[], visible=False)
-                        )
-                chat_llm_source.change(update_chat_model_dropdowns, inputs=[chat_llm_source], outputs=[chat_ollama_model, chat_oci_model])
+                        return gr.update(choices=fetch_ollama_models(), visible=True), gr.update(choices=[], visible=False)
+                chat_llm_source.change(update_chat_model_dropdowns_hide_oci, inputs=[chat_llm_source], outputs=[chat_ollama_model, chat_oci_model])
                 chat_message = gr.Textbox(label="Your message", lines=2)
                 send_btn = gr.Button("Send")
                 conversation_html = gr.HTML(label="Conversation", value="", show_label=False)
@@ -609,7 +668,6 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                             chat_top_k, chat_history, chat_system_prompt, chat_temperature, chat_top_p, chat_max_tokens, chat_repeat_penalty],
                     outputs=[conversation_html, chat_history]
                 )
-                """
             with gr.Tab("Agentic RAG"):
                 gr.Markdown("#### Agentic RAG/Chain-of-Thought Chat (Ollama and OCI GenAI)")
                 agent_llm_source = gr.Dropdown(label="LLM Source", choices=["Local Ollama", "OCI GenAI"], value="Local Ollama")
@@ -623,19 +681,13 @@ with gr.Blocks(title="AUSLegalSearch RAG UI", css="""
                 agent_repeat_penalty = gr.Slider(label="Repeat Penalty", value=1.1, minimum=0.5, maximum=2.0, step=0.01)
                 agent_history = gr.State([])
 
-                def update_agent_model_dropdowns(src):
+                def update_agent_model_dropdowns_hide_oci(src):
                     if src == "OCI GenAI":
-                        return (
-                            gr.update(visible=False),
-                            gr.update(choices=fetch_oci_models(), visible=True)
-                        )
+                        return gr.update(visible=False), gr.update(visible=False)
                     else:
-                        return (
-                            gr.update(choices=fetch_ollama_models(), visible=True),
-                            gr.update(choices=[], visible=False)
-                        )
+                        return gr.update(choices=fetch_ollama_models(), visible=True), gr.update(choices=[], visible=False)
 
-                agent_llm_source.change(update_agent_model_dropdowns, inputs=[agent_llm_source], outputs=[agent_ollama_model, agent_oci_model])
+                agent_llm_source.change(update_agent_model_dropdowns_hide_oci, inputs=[agent_llm_source], outputs=[agent_ollama_model, agent_oci_model])
                 agent_message = gr.Textbox(label="Your message", lines=2)
                 agent_send_btn = gr.Button("Send")
                 agent_conversation_html = gr.HTML(label="Conversation", value="", show_label=False)

@@ -65,6 +65,7 @@ Answer strictly from the provided sources and context. Always cite the source se
 When summarizing, be neutral and factual. Never invent legal advice."""
 
 EMBEDDING_MODELS = [
+    "nomic-ai/nomic-embed-text-v1.5",
     "all-MiniLM-L6-v2",
     "BAAI/bge-base-en-v1.5",
     "maastrichtlawtech/bge-legal-en-v1.5",
