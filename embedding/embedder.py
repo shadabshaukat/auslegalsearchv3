@@ -157,7 +157,7 @@ print(vecs.shape)  # (batch_size, 768)
 embedder = Embedder("maastrichtlawtech/bge-legal-en-v1.5")
 
 # Plain HF checkpoint (fallback), e.g., Legal-BERT base
-embedder = Embedder("legal-bert-base-uncased")  # will use AutoModel + mean pooling (dim=768)
+embedder = Embedder("nlpaueb/legal-bert-base-uncased")  # will use AutoModel + mean pooling (dim=768)
 
 # Env-based selection:
 # export AUSLEGALSEARCH_EMBED_MODEL="legal-bert-base-uncased"
