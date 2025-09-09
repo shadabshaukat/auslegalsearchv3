@@ -69,6 +69,7 @@ EMBEDDING_MODELS = [
     "all-MiniLM-L6-v2",
     "BAAI/bge-base-en-v1.5",
     "maastrichtlawtech/bge-legal-en-v1.5",
+    "legal-bert-base-uncased",
 ]
 selected_embedding_model = st.sidebar.selectbox(
     "Embedding Model (for chunk/vectorization)",

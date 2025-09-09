@@ -50,7 +50,7 @@ def read_partition_file(fname):
     with open(fname, "r") as f:
         return [line.strip() for line in f if line.strip()]
 
-def run_embedding_session(session_name, file_list=None, poll_interval=1.0):
+def run_embedding_session(session_name, file_list=None, poll_interval=1.0, model_name=None):
     sess = get_session(session_name)
     if not sess:
         print(f"Session {session_name} not found in DB.")
@@ -61,7 +61,7 @@ def run_embedding_session(session_name, file_list=None, poll_interval=1.0):
     completed_files = get_completed_files(session_name)
     total_files = len(file_list)
     processed_chunks = sess.processed_chunks or 0
-    embedder = Embedder()
+    embedder = Embedder(model_name) if model_name else Embedder()
 
     print(f"Embedding session {session_name} skipping {len(completed_files)} files. Total files: {total_files}")
     try:
@@ -140,6 +140,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.partition_file:
         fnames = read_partition_file(args.partition_file)
-        run_embedding_session(args.session_name, file_list=fnames)
+        run_embedding_session(args.session_name, file_list=fnames, model_name=args.embedding_model)
     else:
-        run_embedding_session(args.session_name)
+        run_embedding_session(args.session_name, model_name=args.embedding_model)
