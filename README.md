@@ -20,6 +20,9 @@
 
 ## Architecture and Workflow
 
+<img width="2548" height="2114" alt="AusLegalSearchv3" src="https://github.com/user-attachments/assets/d90a5d18-d769-44b9-a6b8-5e75ba47727c" />
+
+
 ### System Overview
 
 ```
