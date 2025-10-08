@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from sqlalchemy import text
 
+import signal
+import contextlib
+
 from ingest.loader import parse_txt, parse_html
 from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type
 from embedding.embedder import Embedder
@@ -38,6 +41,29 @@ from db.store import (
     EmbeddingSessionFile, SessionLocal, Document, Embedding
 )
 from db.connector import DB_URL
+
+# Timeouts (seconds). Tunable via env.
+PARSE_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_PARSE", "60"))
+CHUNK_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_CHUNK", "90"))
+EMBED_BATCH_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_EMBED_BATCH", "180"))
+
+class _Timeout(Exception):
+    pass
+
+@contextlib.contextmanager
+def _deadline(seconds: int):
+    if seconds is None or seconds <= 0:
+        yield
+        return
+    def _handler(signum, frame):
+        raise _Timeout(f"operation exceeded {seconds}s")
+    old = signal.signal(signal.SIGALRM, _handler)
+    try:
+        signal.alarm(seconds)
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 SUPPORTED_EXTS = {".txt", ".html"}
 _YEAR_DIR_RE = re.compile(r"^(19|20)\d{2}$")  # 1900-2099
@@ -200,7 +226,8 @@ def _embed_in_batches(embedder: Embedder, texts: List[str], batch_size: int) -> 
     all_vecs = []
     for i in range(0, len(texts), batch_size):
         sub = texts[i:i + batch_size]
-        vecs = embedder.embed(sub)  # ndarray [batch, dim]
+        with _deadline(EMBED_BATCH_TIMEOUT):
+            vecs = embedder.embed(sub)  # ndarray [batch, dim]
         # Extend list with each row (so downstream indexing works)
         for j in range(vecs.shape[0]):
             all_vecs.append(vecs[j])
@@ -268,8 +295,14 @@ def run_worker(
                     esf = EmbeddingSessionFile(session_name=session_name, filepath=filepath, status="pending")
                     dbs.add(esf)
                     dbs.commit()
+                elif getattr(esf, "status", None) == "complete":
+                    # Skip already-completed files to support safe resume
+                    if idx_f % 200 == 0:
+                        print(f"[beta_worker] {session_name}: SKIP already complete {idx_f}/{total_files} -> {filepath}", flush=True)
+                    continue
 
-                base_doc = parse_file(filepath)
+                with _deadline(PARSE_TIMEOUT):
+                    base_doc = parse_file(filepath)
                 if not base_doc or not base_doc.get("text"):
                     esf.status = "error"
                     dbs.commit()
@@ -289,7 +322,8 @@ def run_worker(
                     base_meta["type"] = detected_type
 
                 # Semantic chunking
-                file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                with _deadline(CHUNK_TIMEOUT):
+                    file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
                 if not file_chunks:
                     esf.status = "complete"
                     dbs.commit()
@@ -324,6 +358,21 @@ def run_worker(
                 if os.environ.get("AUSLEGALSEARCH_DEBUG_COUNTS", "0") == "1" and idx_f % 50 == 0:
                     _maybe_print_counts(dbs, session_name, f"after {idx_f} files")
 
+            except _Timeout as e:
+                try:
+                    esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
+                    if esf:
+                        esf.status = "error"
+                        dbs.commit()
+                except Exception:
+                    pass
+                failures.append(filepath)
+                _append_log_line(log_dir, session_name, filepath, success=False)
+                print(f"[beta_worker] {session_name}: TIMEOUT {idx_f}/{total_files} -> {filepath} :: {e}", flush=True)
+                continue
+            except KeyboardInterrupt:
+                print(f"[beta_worker] {session_name}: INTERRUPTED at {idx_f}/{total_files} -> {filepath}", flush=True)
+                raise
             except Exception as e:
                 # Mark session/file error
                 try:
