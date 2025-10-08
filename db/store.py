@@ -536,7 +536,8 @@ def search_fts(query, top_k=10, mode="both"):
         # Optionally, rank: for now keep order, but slice to top_k
         return unique_hits[:top_k]
 
-create_all_tables()
+if os.environ.get("AUSLEGALSEARCH_AUTO_DDL", "1") == "1":
+    create_all_tables()
 
 __all__ = [
     "Base", "engine", "SessionLocal", "Vector", "JSONB", "UUIDType",

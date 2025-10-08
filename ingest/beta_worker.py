@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from sqlalchemy import text
 
 from ingest.loader import parse_txt, parse_html
 from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type
@@ -36,6 +37,7 @@ from db.store import (
     start_session, update_session_progress, complete_session, fail_session,
     EmbeddingSessionFile, SessionLocal, Document, Embedding
 )
+from db.connector import DB_URL
 
 SUPPORTED_EXTS = {".txt", ".html"}
 _YEAR_DIR_RE = re.compile(r"^(19|20)\d{2}$")  # 1900-2099
@@ -174,6 +176,20 @@ def _write_logs(log_dir: str, session_name: str, successes: List[str], failures:
     return {"success_log": succ_path, "error_log": fail_path}
 
 
+def _maybe_print_counts(dbs, session_name: str, label: str) -> None:
+    """
+    If AUSLEGALSEARCH_DEBUG_COUNTS=1, print current documents/embeddings counts with a label.
+    """
+    try:
+        if os.environ.get("AUSLEGALSEARCH_DEBUG_COUNTS", "0") != "1":
+            return
+        docs = dbs.execute(text("SELECT count(*) FROM documents")).scalar()
+        embs = dbs.execute(text("SELECT count(*) FROM embeddings")).scalar()
+        print(f"[beta_worker] {session_name}: DB counts {label}: documents={docs}, embeddings={embs}", flush=True)
+    except Exception as e:
+        print(f"[beta_worker] {session_name}: DB counts {label}: error: {e}", flush=True)
+
+
 def _embed_in_batches(embedder: Embedder, texts: List[str], batch_size: int) -> List:
     """
     Embed texts in smaller batches to avoid large memory spikes / stalls.
@@ -228,9 +244,22 @@ def run_worker(
     failures: List[str] = []
 
     total_files = len(files)
+    # Ensure log dir exists; print DB target and log file paths for diagnostics
+    os.makedirs(log_dir, exist_ok=True)
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(DB_URL)
+        _safe_db = f"{_p.scheme}://{_p.hostname}:{_p.port}/{_p.path.lstrip('/')}"
+    except Exception:
+        _safe_db = DB_URL
+    _succ_path = os.path.join(log_dir, f"{session_name}.success.log")
+    _err_path = os.path.join(log_dir, f"{session_name}.error.log")
+    print(f"[beta_worker] {session_name}: DB = {_safe_db}", flush=True)
+    print(f"[beta_worker] {session_name}: logs: success->{_succ_path}, error->{_err_path}", flush=True)
     print(f"[beta_worker] {session_name}: starting. files={total_files}, batch_size={batch_size}", flush=True)
 
     with SessionLocal() as dbs:
+        _maybe_print_counts(dbs, session_name, "baseline")
         for idx_f, filepath in enumerate(files, start=1):
             try:
                 # Track per-file status row (create if missing; will update on completion)
@@ -292,6 +321,8 @@ def run_worker(
 
                 if idx_f % 10 == 0 or inserted > 0:
                     print(f"[beta_worker] {session_name}: OK {idx_f}/{total_files}, chunks+={inserted}, total_chunks={processed_chunks}", flush=True)
+                if os.environ.get("AUSLEGALSEARCH_DEBUG_COUNTS", "0") == "1" and idx_f % 50 == 0:
+                    _maybe_print_counts(dbs, session_name, f"after {idx_f} files")
 
             except Exception as e:
                 # Mark session/file error

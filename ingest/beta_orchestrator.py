@@ -54,6 +54,7 @@ from ingest.beta_scanner import find_sample_files         # sample/preview mode 
 
 # DB session tracking (use same schema/functions as existing pipeline)
 from db.store import start_session, create_all_tables
+from db.connector import DB_URL
 
 
 def _natural_sort_key(s: str):
@@ -169,8 +170,16 @@ def orchestrate(
     - If waiting, aggregate worker logs into master success/error logs for the base session
     """
     create_all_tables()  # Ensure schema + FTS triggers
-    log_root = Path(log_dir)
+    log_root = Path(log_dir).resolve()
     log_root.mkdir(parents=True, exist_ok=True)
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(DB_URL)
+        _safe_db = f"{_p.scheme}://{_p.hostname}:{_p.port}/{_p.path.lstrip('/')}"
+    except Exception:
+        _safe_db = DB_URL
+    print(f"[beta_orchestrator] DB = {_safe_db}", flush=True)
+    print(f"[beta_orchestrator] logs dir = {log_root}", flush=True)
 
     # Resolve file list
     if sample_per_folder:
@@ -203,6 +212,7 @@ def orchestrate(
         child = f"{session_name}-gpu{i}"
         pfile = f".beta-gpu-partition-{child}.txt"
         write_partition_file(file_part, pfile)
+        print(f"[beta_orchestrator] child={child}, files={len(file_part)}, partition={pfile}", flush=True)
         # Record child session in DB for UI/progress
         start_session(session_name=child, directory=os.path.abspath(root_dir), total_files=len(file_part), total_chunks=None)
         # Launch worker
