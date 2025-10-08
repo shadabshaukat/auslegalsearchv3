@@ -3,10 +3,11 @@ Parallel beta ingestion worker for AUSLegalSearch v3.
 
 This worker:
 - Processes a provided list of files (via --partition_file) OR discovers all files under --root.
-- Parses (.txt/.html), performs semantic, token-aware chunking, embeds, and writes to DB.
+- Parses (.txt/.html), performs semantic, token-aware chunking, embeds (batched), and writes to DB.
 - Tracks progress in EmbeddingSession and EmbeddingSessionFile for the given session_name.
 - Intended to be launched by a multi-GPU orchestrator, one process per GPU with CUDA_VISIBLE_DEVICES set.
 - Writes per-worker log files listing successfully ingested files and failures.
+- NEW: Incremental logging (append to logs per file) and batched embedding to avoid memory stalls.
 
 Usage (typically invoked by orchestrator):
     python -m ingest.beta_worker SESSION_NAME \\
@@ -22,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -145,10 +147,24 @@ def _batch_insert_chunks(
     return inserted
 
 
+def _append_log_line(log_dir: str, session_name: str, file_path: str, success: bool) -> None:
+    os.makedirs(log_dir, exist_ok=True)
+    fname = f"{session_name}.success.log" if success else f"{session_name}.error.log"
+    fpath = os.path.join(log_dir, fname)
+    with open(fpath, "a", encoding="utf-8") as f:
+        f.write(file_path + "\n")
+
+
 def _write_logs(log_dir: str, session_name: str, successes: List[str], failures: List[str]) -> Dict[str, str]:
+    """
+    Final log write (also writes a full copy at the end). Incremental appends are done during processing.
+    """
     os.makedirs(log_dir, exist_ok=True)
     succ_path = os.path.join(log_dir, f"{session_name}.success.log")
     fail_path = os.path.join(log_dir, f"{session_name}.error.log")
+    # dedupe while preserving order
+    successes = list(dict.fromkeys(successes))
+    failures = list(dict.fromkeys(failures))
     with open(succ_path, "w", encoding="utf-8") as f:
         for p in successes:
             f.write(p + "\n")
@@ -156,6 +172,23 @@ def _write_logs(log_dir: str, session_name: str, successes: List[str], failures:
         for p in failures:
             f.write(p + "\n")
     return {"success_log": succ_path, "error_log": fail_path}
+
+
+def _embed_in_batches(embedder: Embedder, texts: List[str], batch_size: int) -> List:
+    """
+    Embed texts in smaller batches to avoid large memory spikes / stalls.
+    Returns a list-like of vectors aligned with texts.
+    """
+    if batch_size <= 0:
+        batch_size = 64
+    all_vecs = []
+    for i in range(0, len(texts), batch_size):
+        sub = texts[i:i + batch_size]
+        vecs = embedder.embed(sub)  # ndarray [batch, dim]
+        # Extend list with each row (so downstream indexing works)
+        for j in range(vecs.shape[0]):
+            all_vecs.append(vecs[j])
+    return all_vecs
 
 
 def run_worker(
@@ -188,12 +221,17 @@ def run_worker(
         max_tokens=int(token_max),
     )
 
+    batch_size = int(os.environ.get("AUSLEGALSEARCH_EMBED_BATCH", "64"))
+
     processed_chunks = 0
     successes: List[str] = []
     failures: List[str] = []
 
+    total_files = len(files)
+    print(f"[beta_worker] {session_name}: starting. files={total_files}, batch_size={batch_size}", flush=True)
+
     with SessionLocal() as dbs:
-        for filepath in files:
+        for idx_f, filepath in enumerate(files, start=1):
             try:
                 # Track per-file status row (create if missing; will update on completion)
                 esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
@@ -207,6 +245,8 @@ def run_worker(
                     esf.status = "error"
                     dbs.commit()
                     failures.append(filepath)
+                    _append_log_line(log_dir, session_name, filepath, success=False)
+                    print(f"[beta_worker] {session_name}: FAILED (empty) {idx_f}/{total_files} -> {filepath}", flush=True)
                     continue
 
                 # Enrich metadata
@@ -224,12 +264,14 @@ def run_worker(
                 if not file_chunks:
                     esf.status = "complete"
                     dbs.commit()
-                    successes.append(filepath)  # processed but produced zero chunks
+                    successes.append(filepath)
+                    _append_log_line(log_dir, session_name, filepath, success=True)
+                    print(f"[beta_worker] {session_name}: OK (0 chunks) {idx_f}/{total_files} -> {filepath}", flush=True)
                     continue
 
                 # Batch embed
                 texts = [c["text"] for c in file_chunks]
-                vecs = embedder.embed(texts)
+                vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
 
                 # Insert
                 inserted = _batch_insert_chunks(
@@ -246,8 +288,12 @@ def run_worker(
                 dbs.commit()
                 update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
                 successes.append(filepath)
+                _append_log_line(log_dir, session_name, filepath, success=True)
 
-            except Exception:
+                if idx_f % 10 == 0 or inserted > 0:
+                    print(f"[beta_worker] {session_name}: OK {idx_f}/{total_files}, chunks+={inserted}, total_chunks={processed_chunks}", flush=True)
+
+            except Exception as e:
                 # Mark session/file error
                 try:
                     esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
@@ -257,22 +303,19 @@ def run_worker(
                 except Exception:
                     pass
                 failures.append(filepath)
-                # Continue to next file instead of failing entire worker; comment below to change behavior
+                _append_log_line(log_dir, session_name, filepath, success=False)
+                print(f"[beta_worker] {session_name}: FAILED {idx_f}/{total_files} -> {filepath} :: {e}", flush=True)
+                # Continue to next file instead of failing entire worker
                 continue
 
     # Write logs
     paths = _write_logs(log_dir, session_name, successes, failures)
-    print(f"[beta_worker] Session {session_name} complete. Files OK: {len(successes)}, failed: {len(failures)}")
-    print(f"[beta_worker] Success log: {paths['success_log']}")
-    print(f"[beta_worker] Error log:   {paths['error_log']}")
+    print(f"[beta_worker] Session {session_name} complete. Files OK: {len(successes)}, failed: {len(failures)}", flush=True)
+    print(f"[beta_worker] Success log: {paths['success_log']}", flush=True)
+    print(f"[beta_worker] Error log:   {paths['error_log']}", flush=True)
 
-    # Mark session complete if no failures; else leave as error if needed
-    if failures:
-        # If any file failed, keep session marked 'complete' overall or 'error'?
-        # We choose complete for the session to avoid blocking orchestrator; failures captured in logs.
-        complete_session(session_name)
-    else:
-        complete_session(session_name)
+    # Mark session complete (do not hard-fail on partial errors; logs capture details)
+    complete_session(session_name)
 
 
 def _parse_cli_args(argv: List[str]) -> Dict[str, Any]:
