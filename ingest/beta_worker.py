@@ -271,6 +271,35 @@ def _embed_in_batches(embedder: Embedder, texts: List[str], batch_size: int) -> 
             all_vecs.append(vecs[j])
     return all_vecs
 
+def _fallback_chunk_text(text: str, base_meta: Dict[str, Any], cfg: ChunkingConfig) -> List[Dict[str, Any]]:
+    """
+    Fallback chunker that slices text by characters when semantic chunker times out or fails.
+    Uses configurable window/overlap to create chunk dicts compatible with downstream pipeline.
+    """
+    chars_per_chunk = int(os.environ.get("AUSLEGALSEARCH_FALLBACK_CHARS_PER_CHUNK", "4000"))
+    overlap_chars = int(os.environ.get("AUSLEGALSEARCH_FALLBACK_OVERLAP_CHARS", "200"))
+    if chars_per_chunk <= 0:
+        chars_per_chunk = 4000
+    if overlap_chars < 0:
+        overlap_chars = 0
+    step = max(1, chars_per_chunk - overlap_chars)
+    chunks: List[Dict[str, Any]] = []
+    n = len(text or "")
+    i = 0
+    idx = 0
+    while i < n:
+        j = min(n, i + chars_per_chunk)
+        slice_text = text[i:j]
+        md = dict(base_meta or {})
+        md.setdefault("strategy", "fallback-naive")
+        md["fallback"] = True
+        md["start_char"] = i
+        md["end_char"] = j
+        chunks.append({"text": slice_text, "chunk_metadata": md})
+        idx += 1
+        i += step
+    return chunks
+
 
 def run_worker(
     session_name: str,
@@ -417,6 +446,47 @@ def run_worker(
                     _maybe_print_counts(dbs, session_name, f"after {idx_f} files")
 
             except _Timeout as e:
+                # Try fallback if timeout occurred during chunking
+                if (current_stage == "chunk"
+                    and os.environ.get("AUSLEGALSEARCH_FALLBACK_CHUNK_ON_TIMEOUT", "1") != "0"
+                    and "base_doc" in locals()
+                    and isinstance(base_doc, dict)
+                    and base_doc.get("text")):
+                    try:
+                        fb_chunks = _fallback_chunk_text(base_doc["text"], base_meta, cfg)
+                        texts = [c["text"] for c in fb_chunks]
+                        vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
+                        inserted = _batch_insert_chunks(
+                            session=dbs,
+                            chunks=fb_chunks,
+                            vectors=vecs,
+                            source_path=filepath,
+                            fmt=base_doc.get("format", Path(filepath).suffix.lower().strip(".")),
+                        )
+                        processed_chunks += inserted
+                        try:
+                            esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
+                            if esf:
+                                esf.status = "complete"
+                                dbs.commit()
+                        except Exception:
+                            pass
+                        update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
+                        successes.append(filepath)
+                        _append_log_line(log_dir, session_name, filepath, success=True)
+                        _append_error_detail(
+                            log_dir, session_name, filepath,
+                            "chunk", "Timeout", "Chunk timeout; fallback succeeded",
+                            int((time.time() - stage_start) * 1000) if stage_start else None,
+                            {"text_len": len(base_doc.get("text","")), "fallback": True, "fallback_chunks": len(fb_chunks), "batch_size": batch_size}
+                        )
+                        if idx_f % 10 == 0 or inserted > 0:
+                            print(f"[beta_worker] {session_name}: OK (fallback) {idx_f}/{total_files}, chunks+={inserted}, total_chunks={processed_chunks}", flush=True)
+                        continue
+                    except Exception as e2:
+                        # Fall through to treat as failure
+                        e = e2
+                # Failure path
                 try:
                     esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
                     if esf:
@@ -431,14 +501,55 @@ def run_worker(
                     log_dir, session_name, filepath,
                     current_stage or "unknown", "Timeout", str(e),
                     int((time.time() - stage_start) * 1000) if stage_start else None,
-                    {"text_len": current_text_len, "chunk_count": current_chunk_count, "batch_size": batch_size}
+                    {"text_len": current_text_len, "chunk_count": current_chunk_count, "batch_size": batch_size, "fallback": False}
                 )
                 continue
             except KeyboardInterrupt:
                 print(f"[beta_worker] {session_name}: INTERRUPTED at {idx_f}/{total_files} -> {filepath}", flush=True)
                 raise
             except Exception as e:
-                # Mark session/file error
+                # If failure in chunk stage, attempt naive fallback chunking
+                if (current_stage == "chunk"
+                    and os.environ.get("AUSLEGALSEARCH_FALLBACK_CHUNK_ON_TIMEOUT", "1") != "0"
+                    and "base_doc" in locals()
+                    and isinstance(base_doc, dict)
+                    and base_doc.get("text")):
+                    try:
+                        fb_chunks = _fallback_chunk_text(base_doc["text"], base_meta, cfg)
+                        texts = [c["text"] for c in fb_chunks]
+                        vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
+                        inserted = _batch_insert_chunks(
+                            session=dbs,
+                            chunks=fb_chunks,
+                            vectors=vecs,
+                            source_path=filepath,
+                            fmt=base_doc.get("format", Path(filepath).suffix.lower().strip(".")),
+                        )
+                        processed_chunks += inserted
+                        try:
+                            esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
+                            if esf:
+                                esf.status = "complete"
+                                dbs.commit()
+                        except Exception:
+                            pass
+                        update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
+                        successes.append(filepath)
+                        _append_log_line(log_dir, session_name, filepath, success=True)
+                        _append_error_detail(
+                            log_dir, session_name, filepath,
+                            "chunk", type(e).__name__, "Primary chunker error; fallback succeeded",
+                            int((time.time() - stage_start) * 1000) if stage_start else None,
+                            {"text_len": len(base_doc.get("text","")), "fallback": True, "fallback_chunks": len(fb_chunks), "batch_size": batch_size},
+                            traceback.format_exc()
+                        )
+                        if idx_f % 10 == 0 or inserted > 0:
+                            print(f"[beta_worker] {session_name}: OK (fallback) {idx_f}/{total_files}, chunks+={inserted}, total_chunks={processed_chunks}", flush=True)
+                        continue
+                    except Exception as e2:
+                        # Fall through to regular failure handling
+                        e = e2
+                # Regular failure handling
                 try:
                     esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
                     if esf:
@@ -456,7 +567,6 @@ def run_worker(
                     {"text_len": current_text_len, "chunk_count": current_chunk_count, "batch_size": batch_size},
                     traceback.format_exc()
                 )
-                # Continue to next file instead of failing entire worker
                 continue
 
     # Write logs
