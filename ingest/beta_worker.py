@@ -30,6 +30,8 @@ from sqlalchemy import text
 
 import signal
 import contextlib
+import json
+import traceback
 
 from ingest.loader import parse_txt, parse_html
 from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type
@@ -201,6 +203,42 @@ def _write_logs(log_dir: str, session_name: str, successes: List[str], failures:
             f.write(p + "\n")
     return {"success_log": succ_path, "error_log": fail_path}
 
+def _error_details_enabled() -> bool:
+    return os.environ.get("AUSLEGALSEARCH_ERROR_DETAILS", "1") == "1"
+
+def _append_error_detail(
+    log_dir: str,
+    session_name: str,
+    file_path: str,
+    stage: str,
+    error_type: str,
+    message: str,
+    duration_ms: Optional[int] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    tb: Optional[str] = None
+) -> None:
+    if not _error_details_enabled():
+        return
+    try:
+        rec = {
+            "session": session_name,
+            "file": file_path,
+            "stage": stage,
+            "error_type": error_type,
+            "message": message,
+            "duration_ms": duration_ms,
+            "meta": meta or {},
+            "ts": int(time.time() * 1000),
+        }
+        if os.environ.get("AUSLEGALSEARCH_ERROR_TRACE", "0") == "1":
+            rec["traceback"] = tb or ""
+        path = os.path.join(log_dir, f"{session_name}.errors.ndjson")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # Never fail pipeline due to logging
+        pass
+
 
 def _maybe_print_counts(dbs, session_name: str, label: str) -> None:
     """
@@ -286,6 +324,10 @@ def run_worker(
     print(f"[beta_worker] {session_name}: starting. files={total_files}, batch_size={batch_size}", flush=True)
 
     with SessionLocal() as dbs:
+        current_stage: Optional[str] = None
+        stage_start: float = 0.0
+        current_text_len: Optional[int] = None
+        current_chunk_count: Optional[int] = None
         _maybe_print_counts(dbs, session_name, "baseline")
         for idx_f, filepath in enumerate(files, start=1):
             try:
@@ -301,14 +343,23 @@ def run_worker(
                         print(f"[beta_worker] {session_name}: SKIP already complete {idx_f}/{total_files} -> {filepath}", flush=True)
                     continue
 
+                current_stage = "parse"
+                stage_start = time.time()
                 with _deadline(PARSE_TIMEOUT):
                     base_doc = parse_file(filepath)
+                current_text_len = len(base_doc.get("text", ""))
                 if not base_doc or not base_doc.get("text"):
                     esf.status = "error"
                     dbs.commit()
                     failures.append(filepath)
                     _append_log_line(log_dir, session_name, filepath, success=False)
                     print(f"[beta_worker] {session_name}: FAILED (empty) {idx_f}/{total_files} -> {filepath}", flush=True)
+                    _append_error_detail(
+                        log_dir, session_name, filepath,
+                        current_stage or "parse", "EmptyText", "Parsed file has no text",
+                        int((time.time() - stage_start) * 1000) if stage_start else None,
+                        {"text_len": current_text_len}
+                    )
                     continue
 
                 # Enrich metadata
@@ -322,8 +373,11 @@ def run_worker(
                     base_meta["type"] = detected_type
 
                 # Semantic chunking
+                current_stage = "chunk"
+                stage_start = time.time()
                 with _deadline(CHUNK_TIMEOUT):
                     file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                current_chunk_count = len(file_chunks)
                 if not file_chunks:
                     esf.status = "complete"
                     dbs.commit()
@@ -334,9 +388,13 @@ def run_worker(
 
                 # Batch embed
                 texts = [c["text"] for c in file_chunks]
+                current_stage = "embed"
+                stage_start = time.time()
                 vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
 
                 # Insert
+                current_stage = "insert"
+                stage_start = time.time()
                 inserted = _batch_insert_chunks(
                     session=dbs,
                     chunks=file_chunks,
@@ -369,6 +427,12 @@ def run_worker(
                 failures.append(filepath)
                 _append_log_line(log_dir, session_name, filepath, success=False)
                 print(f"[beta_worker] {session_name}: TIMEOUT {idx_f}/{total_files} -> {filepath} :: {e}", flush=True)
+                _append_error_detail(
+                    log_dir, session_name, filepath,
+                    current_stage or "unknown", "Timeout", str(e),
+                    int((time.time() - stage_start) * 1000) if stage_start else None,
+                    {"text_len": current_text_len, "chunk_count": current_chunk_count, "batch_size": batch_size}
+                )
                 continue
             except KeyboardInterrupt:
                 print(f"[beta_worker] {session_name}: INTERRUPTED at {idx_f}/{total_files} -> {filepath}", flush=True)
@@ -385,6 +449,13 @@ def run_worker(
                 failures.append(filepath)
                 _append_log_line(log_dir, session_name, filepath, success=False)
                 print(f"[beta_worker] {session_name}: FAILED {idx_f}/{total_files} -> {filepath} :: {e}", flush=True)
+                _append_error_detail(
+                    log_dir, session_name, filepath,
+                    current_stage or "unknown", type(e).__name__, str(e),
+                    int((time.time() - stage_start) * 1000) if stage_start else None,
+                    {"text_len": current_text_len, "chunk_count": current_chunk_count, "batch_size": batch_size},
+                    traceback.format_exc()
+                )
                 # Continue to next file instead of failing entire worker
                 continue
 
