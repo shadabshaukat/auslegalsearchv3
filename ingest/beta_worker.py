@@ -34,7 +34,7 @@ import json
 import traceback
 
 from ingest.loader import parse_txt, parse_html
-from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type
+from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type, chunk_legislation_dashed_semantic
 from embedding.embedder import Embedder
 
 from db.store import (
@@ -405,7 +405,12 @@ def run_worker(
                 current_stage = "chunk"
                 stage_start = time.time()
                 with _deadline(CHUNK_TIMEOUT):
-                    file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                    # Try dashed-header aware legislation chunking first regardless of detected type.
+                    # This ensures CLI-provided token config (target/overlap/max) cascades into all chunking paths.
+                    file_chunks = chunk_legislation_dashed_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                    if not file_chunks:
+                        # Fallback to generic semantic chunking (uses headings/sentences with the same cfg)
+                        file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
                 current_chunk_count = len(file_chunks)
                 if not file_chunks:
                     esf.status = "complete"
