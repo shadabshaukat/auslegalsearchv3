@@ -311,3 +311,124 @@ def chunk_document_semantic(
                 "chunk_metadata": md
             })
     return chunks
+
+
+# ---- Legislation dashed-header block parsing and chunking (for beta pipeline) ----
+
+_DASH_LINE_RE = re.compile(r"^\s*-{3,}\s*$", re.M)
+
+def _parse_dashed_header(header_text: str) -> Dict[str, str]:
+    """
+    Parse key: value pairs inside a dashed header block.
+    Example keys seen in data: title, regulation, chunk_id, section, etc.
+    Returns a dict of lowercase keys -> stripped values.
+    """
+    meta: Dict[str, str] = {}
+    for line in (header_text or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = (k or "").strip().lower()
+        v = (v or "").strip()
+        if k:
+            meta[k] = v
+    return meta
+
+def parse_dashed_blocks(doc_text: str) -> List[Tuple[Dict[str, str], str]]:
+    """
+    Extract repeated dashed-header sections:
+      -----\n
+      key: value\n
+      key: value\n
+      -----\n
+      <body until next dashed header or EOF>
+    Returns list of (header_meta_dict, body_text).
+    """
+    text = doc_text or ""
+    if not text.strip():
+        return []
+
+    # Strategy: find all dashed lines and slice segments between them
+    # Expect pattern: DASH, header, DASH, body, (repeat)
+    positions = [m.start() for m in _DASH_LINE_RE.finditer(text)]
+    if not positions:
+        return []
+
+    # Build a regex to capture blocks robustly:
+    # (DASH header DASH) body (up to next DASH or end)
+    pattern = re.compile(
+        r"^\s*-{3,}\s*$\s*"
+        r"(?P<header>.*?)"
+        r"^\s*-{3,}\s*$\s*"
+        r"(?P<body>.*?)(?=^\s*-{3,}\s*$|\Z)",
+        re.M | re.S
+    )
+
+    blocks: List[Tuple[Dict[str, str], str]] = []
+    for m in pattern.finditer(text):
+        header_text = m.group("header") or ""
+        body = (m.group("body") or "").strip()
+        meta = _parse_dashed_header(header_text)
+        # Only consider as a dashed block if at least one key:value was parsed
+        if meta and body:
+            blocks.append((meta, body))
+    return blocks
+
+def chunk_legislation_dashed_semantic(
+    doc_text: str,
+    base_meta: Optional[Dict] = None,
+    cfg: Optional[ChunkingConfig] = None
+) -> List[Dict]:
+    """
+    Legislation-aware chunking driven by dashed headers (title/regulation/chunk_id...).
+    For each dashed block:
+      - Parse header meta (lowercased keys)
+      - Semantic chunk the body with chunk_text_semantic using token-aware config
+      - Attach header meta + base_meta into chunk_metadata
+    Also includes any preface text before the first dashed header (useful if an upstream loader stripped the first header).
+    If no dashed blocks found, returns an empty list (caller may fall back to chunk_document_semantic).
+    """
+    cfg = cfg or ChunkingConfig()
+    dashed_blocks = parse_dashed_blocks(doc_text)
+    if not dashed_blocks:
+        return []
+
+    out: List[Dict] = []
+    sec_idx = 0
+    # Include any preface text that appears before the first dashed header (e.g., body of an initial header removed upstream)
+    try:
+        m_first = _DASH_LINE_RE.search(doc_text or "")
+        if m_first:
+            preface = (doc_text or "")[: m_first.start()].strip()
+            if preface:
+                chs0 = chunk_text_semantic(preface, cfg, section_title=None, section_idx=sec_idx)
+                for bc in chs0:
+                    md0 = dict(base_meta or {})
+                    cm0 = dict(bc.get("chunk_metadata") or {})
+                    md0.update(cm0)
+                    out.append({
+                        "text": bc["text"],
+                        "chunk_metadata": md0
+                    })
+                sec_idx += 1
+    except Exception:
+        # Preface inclusion should never break processing
+        pass
+    for header_meta, body in dashed_blocks:
+        section_title = header_meta.get("title") or header_meta.get("section_title") or header_meta.get("section")
+        # Chunk body semantically with heading context
+        chs = chunk_text_semantic(body, cfg, section_title=section_title, section_idx=sec_idx)
+        for bc in chs:
+            md = dict(base_meta or {})
+            # carry over section-level metadata derived from dashed header
+            md.update(header_meta)
+            # also merge per-chunk metadata (tokens_est, chunk_idx, section_title/idx)
+            cm = dict(bc.get("chunk_metadata") or {})
+            md.update(cm)
+            out.append({
+                "text": bc["text"],
+                "chunk_metadata": md
+            })
+        sec_idx += 1
+    return out
