@@ -45,6 +45,8 @@ import os
 import sys
 import json
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -180,6 +182,9 @@ def orchestrate(
         _safe_db = DB_URL
     print(f"[beta_orchestrator] DB = {_safe_db}", flush=True)
     print(f"[beta_orchestrator] logs dir = {log_root}", flush=True)
+    # Track aggregation window (UTC ISO) for master logs
+    t_start = time.time()
+    start_iso = datetime.utcnow().isoformat() + "Z"
 
     # Resolve file list
     if sample_per_folder:
@@ -268,8 +273,33 @@ def orchestrate(
 
     master_success = log_root / f"{session_name}.success.log"
     master_error = log_root / f"{session_name}.error.log"
-    _write_lines(master_success, all_success)
-    _write_lines(master_error, all_error)
+
+    end_iso = datetime.utcnow().isoformat() + "Z"
+    duration_sec = int(time.time() - t_start)
+
+    # Write master success log with header + aggregated entries
+    with master_success.open("w", encoding="utf-8") as f:
+        f.write(f"# session={session_name}\n")
+        f.write(f"# started_at={start_iso}\n")
+        f.write(f"# ended_at={end_iso}\n")
+        f.write(f"# duration_sec={duration_sec}\n")
+        f.write(f"# child_sessions={len(child_sessions)}\n")
+        f.write(f"# files_ok={len(all_success)}\n")
+        f.write("# --- aggregated child success entries ---\n")
+        for ln in all_success:
+            f.write(ln + "\n")
+
+    # Write master error log with header + aggregated entries
+    with master_error.open("w", encoding="utf-8") as f:
+        f.write(f"# session={session_name}\n")
+        f.write(f"# started_at={start_iso}\n")
+        f.write(f"# ended_at={end_iso}\n")
+        f.write(f"# duration_sec={duration_sec}\n")
+        f.write(f"# child_sessions={len(child_sessions)}\n")
+        f.write(f"# files_failed={len(all_error)}\n")
+        f.write("# --- aggregated child error entries ---\n")
+        for ln in all_error:
+            f.write(ln + "\n")
 
     print(f"[beta_orchestrator] Aggregated logs for session {session_name}")
     print(f"[beta_orchestrator] Success log: {master_success} (files: {len(all_success)})")
@@ -279,6 +309,9 @@ def orchestrate(
     summary["aggregated_error_log"] = str(master_error)
     summary["success_count"] = len(all_success)
     summary["error_count"] = len(all_error)
+    summary["started_at"] = start_iso
+    summary["ended_at"] = end_iso
+    summary["duration_sec"] = duration_sec
     return summary
 
 

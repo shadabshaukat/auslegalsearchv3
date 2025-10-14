@@ -185,22 +185,96 @@ def _append_log_line(log_dir: str, session_name: str, file_path: str, success: b
         f.write(file_path + "\n")
 
 
+def _metrics_enabled() -> bool:
+    return os.environ.get("AUSLEGALSEARCH_LOG_METRICS", "1") != "0"
+
+
+def _append_success_metrics_line(
+    log_dir: str,
+    session_name: str,
+    file_path: str,
+    chunks_count: int,
+    text_len: int,
+    cfg: ChunkingConfig,
+    strategy: str,
+    detected_type: Optional[str] = None,
+    section_count: Optional[int] = None,
+    tokens_est_total: Optional[int] = None,
+    tokens_est_mean: Optional[int] = None,
+) -> None:
+    """
+    Append a single TSV-style line to the child success log with per-file metrics.
+    Keeps logging overhead minimal for performance.
+    """
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        fpath = os.path.join(log_dir, f"{session_name}.success.log")
+        if not _metrics_enabled():
+            # Write only the file path (legacy format) and avoid computing metrics
+            with open(fpath, "a", encoding="utf-8") as f:
+                f.write(str(file_path) + "\n")
+            return
+        parts = [
+            str(file_path),
+            f"chunks={int(chunks_count)}",
+            f"text_len={int(text_len)}",
+            f"strategy={strategy or ''}",
+            f"target_tokens={int(cfg.target_tokens)}",
+            f"overlap_tokens={int(cfg.overlap_tokens)}",
+            f"max_tokens={int(cfg.max_tokens)}",
+        ]
+        if detected_type:
+            parts.append(f"type={detected_type}")
+        if section_count is not None:
+            parts.append(f"section_count={int(section_count)}")
+        if tokens_est_total is not None:
+            parts.append(f"tokens_est_total={int(tokens_est_total)}")
+        if tokens_est_mean is not None:
+            parts.append(f"tokens_est_mean={int(tokens_est_mean)}")
+        line = "\t".join(parts)
+        with open(fpath, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Never fail pipeline due to logging
+        pass
+
+
 def _write_logs(log_dir: str, session_name: str, successes: List[str], failures: List[str]) -> Dict[str, str]:
     """
-    Final log write (also writes a full copy at the end). Incremental appends are done during processing.
+    Finalize logs. We DO NOT overwrite the child success log to preserve
+    the per-file metrics lines emitted during processing. Instead, append a compact
+    summary footer to each log. This keeps overhead negligible.
     """
     os.makedirs(log_dir, exist_ok=True)
     succ_path = os.path.join(log_dir, f"{session_name}.success.log")
     fail_path = os.path.join(log_dir, f"{session_name}.error.log")
-    # dedupe while preserving order
+
+    # Ensure files exist
+    try:
+        open(succ_path, "a", encoding="utf-8").close()
+    except Exception:
+        pass
+    try:
+        open(fail_path, "a", encoding="utf-8").close()
+    except Exception:
+        pass
+
+    # Deduplicate file path lists (for counts only; we don't rewrite logs)
     successes = list(dict.fromkeys(successes))
     failures = list(dict.fromkeys(failures))
-    with open(succ_path, "w", encoding="utf-8") as f:
-        for p in successes:
-            f.write(p + "\n")
-    with open(fail_path, "w", encoding="utf-8") as f:
-        for p in failures:
-            f.write(p + "\n")
+
+    # Append summary footers (minimal I/O)
+    try:
+        with open(succ_path, "a", encoding="utf-8") as f:
+            f.write(f"# summary files_ok={len(successes)}\n")
+    except Exception:
+        pass
+    try:
+        with open(fail_path, "a", encoding="utf-8") as f:
+            f.write(f"# summary files_failed={len(failures)}\n")
+    except Exception:
+        pass
+
     return {"success_log": succ_path, "error_log": fail_path}
 
 def _error_details_enabled() -> bool:
@@ -357,6 +431,7 @@ def run_worker(
         stage_start: float = 0.0
         current_text_len: Optional[int] = None
         current_chunk_count: Optional[int] = None
+        chunk_strategy: Optional[str] = None
         _maybe_print_counts(dbs, session_name, "baseline")
         for idx_f, filepath in enumerate(files, start=1):
             try:
@@ -405,23 +480,39 @@ def run_worker(
                 current_stage = "chunk"
                 stage_start = time.time()
                 with _deadline(CHUNK_TIMEOUT):
-                    # Try dashed-header aware legislation chunking first regardless of detected type.
-                    # This ensures CLI-provided token config (target/overlap/max) cascades into all chunking paths.
+                    # Try dashed-header aware chunking first (works for any dashed-header format).
                     file_chunks = chunk_legislation_dashed_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
-                    if not file_chunks:
-                        # Fallback to generic semantic chunking (uses headings/sentences with the same cfg)
+                    if file_chunks:
+                        chunk_strategy = "dashed-semantic"
+                    else:
+                        # Fallback to generic semantic chunking (heading/sentences with same cfg)
                         file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                        if file_chunks:
+                            chunk_strategy = "semantic"
                     # Optional RCTS fallback for generic types (env-controlled)
                     if (not file_chunks) and os.environ.get("AUSLEGALSEARCH_USE_RCTS_GENERIC", "0") == "1":
                         rcts_chunks = chunk_generic_rcts(base_doc["text"], base_meta=base_meta, cfg=cfg)
                         if rcts_chunks:
                             file_chunks = rcts_chunks
+                            chunk_strategy = "rcts-generic"
                 current_chunk_count = len(file_chunks)
                 if not file_chunks:
                     esf.status = "complete"
                     dbs.commit()
                     successes.append(filepath)
-                    _append_log_line(log_dir, session_name, filepath, success=True)
+                    _append_success_metrics_line(
+                        log_dir=log_dir,
+                        session_name=session_name,
+                        file_path=filepath,
+                        chunks_count=0,
+                        text_len=current_text_len or 0,
+                        cfg=cfg,
+                        strategy=chunk_strategy or "no-chunks",
+                        detected_type=detected_type,
+                        section_count=0,
+                        tokens_est_total=0,
+                        tokens_est_mean=0,
+                    )
                     print(f"[beta_worker] {session_name}: OK (0 chunks) {idx_f}/{total_files} -> {filepath}", flush=True)
                     continue
 
@@ -448,7 +539,39 @@ def run_worker(
                 dbs.commit()
                 update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
                 successes.append(filepath)
-                _append_log_line(log_dir, session_name, filepath, success=True)
+                # Compute light-weight per-file metrics for logging (O(n) in chunks; negligible vs embedding)
+                try:
+                    section_idxs = set()
+                    token_vals = []
+                    for c in file_chunks:
+                        md = c.get("chunk_metadata") or {}
+                        if isinstance(md, dict):
+                            si = md.get("section_idx")
+                            if si is not None:
+                                section_idxs.add(si)
+                            tv = md.get("tokens_est")
+                            if isinstance(tv, int):
+                                token_vals.append(tv)
+                    section_count = len(section_idxs) if section_idxs else 0
+                    tokens_est_total = sum(token_vals) if token_vals else None
+                    tokens_est_mean = int(round(tokens_est_total / len(token_vals))) if token_vals else None
+                except Exception:
+                    section_count = None
+                    tokens_est_total = None
+                    tokens_est_mean = None
+                _append_success_metrics_line(
+                    log_dir=log_dir,
+                    session_name=session_name,
+                    file_path=filepath,
+                    chunks_count=current_chunk_count or 0,
+                    text_len=current_text_len or 0,
+                    cfg=cfg,
+                    strategy=chunk_strategy or "semantic",
+                    detected_type=detected_type,
+                    section_count=section_count,
+                    tokens_est_total=tokens_est_total,
+                    tokens_est_mean=tokens_est_mean,
+                )
 
                 if idx_f % 10 == 0 or inserted > 0:
                     print(f"[beta_worker] {session_name}: OK {idx_f}/{total_files}, chunks+={inserted}, total_chunks={processed_chunks}", flush=True)
@@ -483,7 +606,16 @@ def run_worker(
                             pass
                         update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
                         successes.append(filepath)
-                        _append_log_line(log_dir, session_name, filepath, success=True)
+                        _append_success_metrics_line(
+                            log_dir=log_dir,
+                            session_name=session_name,
+                            file_path=filepath,
+                            chunks_count=inserted,
+                            text_len=len(base_doc.get("text","")),
+                            cfg=cfg,
+                            strategy="fallback-naive",
+                            detected_type=detected_type,
+                        )
                         _append_error_detail(
                             log_dir, session_name, filepath,
                             "chunk", "Timeout", "Chunk timeout; fallback succeeded",
@@ -545,7 +677,16 @@ def run_worker(
                             pass
                         update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
                         successes.append(filepath)
-                        _append_log_line(log_dir, session_name, filepath, success=True)
+                        _append_success_metrics_line(
+                            log_dir=log_dir,
+                            session_name=session_name,
+                            file_path=filepath,
+                            chunks_count=inserted,
+                            text_len=len(base_doc.get("text","")),
+                            cfg=cfg,
+                            strategy="fallback-naive",
+                            detected_type=detected_type,
+                        )
                         _append_error_detail(
                             log_dir, session_name, filepath,
                             "chunk", type(e).__name__, "Primary chunker error; fallback succeeded",
