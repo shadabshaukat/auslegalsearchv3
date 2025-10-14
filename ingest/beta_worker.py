@@ -531,7 +531,6 @@ def run_worker(
                         section_count=0,
                         tokens_est_total=0,
                         tokens_est_mean=0,
-                    ,
                         parse_ms=parse_ms,
                         chunk_ms=chunk_ms,
                         embed_ms=None,
