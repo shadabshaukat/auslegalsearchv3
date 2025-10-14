@@ -201,6 +201,10 @@ def _append_success_metrics_line(
     section_count: Optional[int] = None,
     tokens_est_total: Optional[int] = None,
     tokens_est_mean: Optional[int] = None,
+    parse_ms: Optional[int] = None,
+    chunk_ms: Optional[int] = None,
+    embed_ms: Optional[int] = None,
+    insert_ms: Optional[int] = None,
 ) -> None:
     """
     Append a single TSV-style line to the child success log with per-file metrics.
@@ -231,6 +235,14 @@ def _append_success_metrics_line(
             parts.append(f"tokens_est_total={int(tokens_est_total)}")
         if tokens_est_mean is not None:
             parts.append(f"tokens_est_mean={int(tokens_est_mean)}")
+        if parse_ms is not None:
+            parts.append(f"parse_ms={int(parse_ms)}")
+        if chunk_ms is not None:
+            parts.append(f"chunk_ms={int(chunk_ms)}")
+        if embed_ms is not None:
+            parts.append(f"embed_ms={int(embed_ms)}")
+        if insert_ms is not None:
+            parts.append(f"insert_ms={int(insert_ms)}")
         line = "\t".join(parts)
         with open(fpath, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -432,6 +444,11 @@ def run_worker(
         current_text_len: Optional[int] = None
         current_chunk_count: Optional[int] = None
         chunk_strategy: Optional[str] = None
+        # Per-stage timings (ms)
+        parse_ms: Optional[int] = None
+        chunk_ms: Optional[int] = None
+        embed_ms: Optional[int] = None
+        insert_ms: Optional[int] = None
         _maybe_print_counts(dbs, session_name, "baseline")
         for idx_f, filepath in enumerate(files, start=1):
             try:
@@ -452,6 +469,7 @@ def run_worker(
                 with _deadline(PARSE_TIMEOUT):
                     base_doc = parse_file(filepath)
                 current_text_len = len(base_doc.get("text", ""))
+                parse_ms = int((time.time() - stage_start) * 1000)
                 if not base_doc or not base_doc.get("text"):
                     esf.status = "error"
                     dbs.commit()
@@ -496,6 +514,7 @@ def run_worker(
                             file_chunks = rcts_chunks
                             chunk_strategy = "rcts-generic"
                 current_chunk_count = len(file_chunks)
+                chunk_ms = int((time.time() - stage_start) * 1000)
                 if not file_chunks:
                     esf.status = "complete"
                     dbs.commit()
@@ -512,6 +531,11 @@ def run_worker(
                         section_count=0,
                         tokens_est_total=0,
                         tokens_est_mean=0,
+                    ,
+                        parse_ms=parse_ms,
+                        chunk_ms=chunk_ms,
+                        embed_ms=None,
+                        insert_ms=None,
                     )
                     print(f"[beta_worker] {session_name}: OK (0 chunks) {idx_f}/{total_files} -> {filepath}", flush=True)
                     continue
@@ -521,6 +545,7 @@ def run_worker(
                 current_stage = "embed"
                 stage_start = time.time()
                 vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
+                embed_ms = int((time.time() - stage_start) * 1000)
 
                 # Insert
                 current_stage = "insert"
@@ -532,6 +557,7 @@ def run_worker(
                     source_path=filepath,
                     fmt=base_doc.get("format", Path(filepath).suffix.lower().strip(".")),
                 )
+                insert_ms = int((time.time() - stage_start) * 1000)
                 processed_chunks += inserted
 
                 # Update progress
@@ -571,6 +597,10 @@ def run_worker(
                     section_count=section_count,
                     tokens_est_total=tokens_est_total,
                     tokens_est_mean=tokens_est_mean,
+                    parse_ms=parse_ms,
+                    chunk_ms=chunk_ms,
+                    embed_ms=embed_ms,
+                    insert_ms=insert_ms,
                 )
 
                 if idx_f % 10 == 0 or inserted > 0:
@@ -588,7 +618,10 @@ def run_worker(
                     try:
                         fb_chunks = _fallback_chunk_text(base_doc["text"], base_meta, cfg)
                         texts = [c["text"] for c in fb_chunks]
+                        t0 = time.time()
                         vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
+                        fb_embed_ms = int((time.time() - t0) * 1000)
+                        t1 = time.time()
                         inserted = _batch_insert_chunks(
                             session=dbs,
                             chunks=fb_chunks,
@@ -596,6 +629,7 @@ def run_worker(
                             source_path=filepath,
                             fmt=base_doc.get("format", Path(filepath).suffix.lower().strip(".")),
                         )
+                        fb_insert_ms = int((time.time() - t1) * 1000)
                         processed_chunks += inserted
                         try:
                             esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
@@ -615,6 +649,10 @@ def run_worker(
                             cfg=cfg,
                             strategy="fallback-naive",
                             detected_type=detected_type,
+                            parse_ms=parse_ms,
+                            chunk_ms=None,
+                            embed_ms=fb_embed_ms,
+                            insert_ms=fb_insert_ms,
                         )
                         _append_error_detail(
                             log_dir, session_name, filepath,
@@ -659,7 +697,10 @@ def run_worker(
                     try:
                         fb_chunks = _fallback_chunk_text(base_doc["text"], base_meta, cfg)
                         texts = [c["text"] for c in fb_chunks]
+                        t0 = time.time()
                         vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
+                        fb_embed_ms = int((time.time() - t0) * 1000)
+                        t1 = time.time()
                         inserted = _batch_insert_chunks(
                             session=dbs,
                             chunks=fb_chunks,
@@ -667,6 +708,7 @@ def run_worker(
                             source_path=filepath,
                             fmt=base_doc.get("format", Path(filepath).suffix.lower().strip(".")),
                         )
+                        fb_insert_ms = int((time.time() - t1) * 1000)
                         processed_chunks += inserted
                         try:
                             esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
@@ -686,6 +728,10 @@ def run_worker(
                             cfg=cfg,
                             strategy="fallback-naive",
                             detected_type=detected_type,
+                            parse_ms=parse_ms,
+                            chunk_ms=None,
+                            embed_ms=fb_embed_ms,
+                            insert_ms=fb_insert_ms,
                         )
                         _append_error_detail(
                             log_dir, session_name, filepath,

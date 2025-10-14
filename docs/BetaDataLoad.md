@@ -418,6 +418,7 @@ Per-file metrics in child success logs (light overhead):
   /abs/path/file.html    chunks=12  text_len=84219  strategy=dashed-semantic  target_tokens=1500  overlap_tokens=192  max_tokens=1920  type=legislation  section_count=37  tokens_est_total=14052  tokens_est_mean=1171
   ```
 - If AUSLEGALSEARCH_LOG_METRICS=0, only the file path is logged (legacy format).
+- Per-stage timing fields: parse_ms, chunk_ms, embed_ms, insert_ms
 - Strategy could be: dashed-semantic | semantic | rcts-generic | fallback-naive | no-chunks
 
 Console output includes DB target, log paths, counts, and periodic progress.
