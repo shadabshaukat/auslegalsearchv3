@@ -34,7 +34,7 @@ import json
 import traceback
 
 from ingest.loader import parse_txt, parse_html
-from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type, chunk_legislation_dashed_semantic
+from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type, chunk_legislation_dashed_semantic, chunk_generic_rcts
 from embedding.embedder import Embedder
 
 from db.store import (
@@ -411,6 +411,11 @@ def run_worker(
                     if not file_chunks:
                         # Fallback to generic semantic chunking (uses headings/sentences with the same cfg)
                         file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                    # Optional RCTS fallback for generic types (env-controlled)
+                    if (not file_chunks) and os.environ.get("AUSLEGALSEARCH_USE_RCTS_GENERIC", "0") == "1":
+                        rcts_chunks = chunk_generic_rcts(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                        if rcts_chunks:
+                            file_chunks = rcts_chunks
                 current_chunk_count = len(file_chunks)
                 if not file_chunks:
                     esf.status = "complete"

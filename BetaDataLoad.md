@@ -307,6 +307,189 @@ E) Journals (beta semantic strategy)
 - Legacy (unchanged): loader.chunk_journal() groups by detected headings and applies a 1500-character policy. The beta path does not call this legacy function.
 
 
+## 8A) Visual chunking decision and workflow
+
+This section provides a visual, end-to-end view of how files are chunked in the beta pipeline, which functions are called, and what metadata is produced. Treaties and journals that begin with a dashed header follow the dashed-header semantic path. Generic texts without dashed headers follow the heading/sentence semantic path, with an optional RCTS fallback.
+
+A) Per-file decision flow in ingest/beta_worker.py
+```mermaid
+flowchart TD
+    A[Start per file] --> B[Parse file (.txt/.html) -> base_doc.text, base_doc.chunk_metadata]
+    B -->|empty text| Z1[Mark error + log] --> End
+    B --> C[Enrich base_meta: derive_path_metadata + base_doc.chunk_metadata]
+    C --> D[detect_doc_type(meta,text) for analytics]
+    D --> E{Chunking}
+    E -->|Try 1| F[chunk_legislation_dashed_semantic(text, base_meta, cfg)]
+    F -->|chunks > 0| G[Proceed with chunks]
+    F -->|no chunks| H[chunk_document_semantic(text, base_meta, cfg)]
+    H -->|chunks > 0| G
+    H -->|no chunks| I{AUSLEGALSEARCH_USE_RCTS_GENERIC == 1?}
+    I -->|yes| J[chunk_generic_rcts(text, base_meta, cfg)]
+    I -->|no| K[No chunks]
+    J -->|chunks > 0| G
+    J -->|no chunks| K
+    K --> G0[Proceed with 0 chunks]
+    G --> L[Embed in batches (GPU)]
+    L --> M[Insert docs+embeddings into DB]
+    M --> N[Update session progress + per-file logs]
+    N --> End
+
+    classDef step fill:#0b7285,stroke:#0b7285,color:#fff
+    classDef alt fill:#495057,stroke:#495057,color:#fff
+    class G,G0,L,M,N step
+    class F,H,J alt
+```
+
+- Try 1: chunk_legislation_dashed_semantic
+  - Works for any dashed-header format (not restricted to “legislation” type). Treaties and journals with dashed headers follow this path. Header metadata (e.g., type, title, author, year, citation, url) is merged into each chunk’s chunk_metadata. Section title is taken from header (title/section).
+- Try 2: chunk_document_semantic
+  - Heading-aware blocks (Roman numerals, 1.2.3., UPPERCASE, “Section N”), then sentence merging to target_tokens with overlap. Ensures max_tokens; hard-splits very long sentences.
+- Optional Try 3: chunk_generic_rcts
+  - Enabled when AUSLEGALSEARCH_USE_RCTS_GENERIC=1 and LangChain splitters are available.
+  - Uses RecursiveCharacterTextSplitter (token-aware via tiktoken if present; else character-approx).
+  - If a first dashed header exists, its key:value pairs are added to metadata for all chunks. strategy="rcts-generic".
+- Safety: If chunking times out or errors, the worker uses a character-window fallback to guarantee coverage.
+
+B) Function map (who calls what)
+```mermaid
+graph TD
+  subgraph Worker
+    W1[beta_worker.run_worker] --> W2[parse_file -> (parse_txt|parse_html)]
+    W2 --> W3[derive_path_metadata + base_doc.chunk_metadata -> base_meta]
+    W3 --> W4[detect_doc_type(meta,text)]
+    W4 --> W5{chunk pipeline}
+  end
+
+  subgraph SemanticChunker
+    S1[chunk_legislation_dashed_semantic]
+    S2[chunk_document_semantic]
+    S3[chunk_generic_rcts (optional)]
+    H1[parse_dashed_blocks]
+    H2[_parse_dashed_header]
+    C1[split_into_blocks]
+    C2[split_into_sentences]
+    C3[chunk_text_semantic]
+  end
+
+  W5 --> S1
+  S1 --> H1 --> H2
+  S1 --> C3
+  W5 -->|fallback| S2
+  S2 --> C1 --> C2
+  S2 --> C3
+  W5 -->|env opt| S3
+
+  subgraph DB&Embed
+    E1[Embedder.embed (batched, GPU)]
+    D1[_batch_insert_chunks (Document+Embedding)]
+  end
+
+  W5 --> E1 --> D1
+```
+
+C) Chunk construction details
+- Token budgets (ChunkingConfig):
+  - target_tokens: goal per chunk size
+  - overlap_tokens: carried sentences at chunk boundaries to preserve context
+  - max_tokens: hard cap; single long sentences are word-sliced to never exceed the max
+  - min_sentence_tokens, min_chunk_tokens: tiny sentences/chunks filtered unless needed
+- Sentence merging:
+  - Sentences are merged until target_tokens. Overlap preserves full sentences up to overlap_tokens.
+- Metadata per chunk:
+  - Common: section_title, section_idx, chunk_idx, tokens_est
+  - Dashed-header path: all header key:value pairs are merged (e.g., type, title, author, year, citation, url)
+  - Path-derived: jurisdiction_guess, rel_path, series_guess, etc.
+  - RCTS generic: strategy="rcts-generic", rcts_token_mode flag
+
+D) File types and default paths
+- Dashed header present (e.g., treaties, some journals, many legislation): chunk_legislation_dashed_semantic
+- Headed prose without dashed header (cases, journals, generic legal text): chunk_document_semantic
+- Highly irregular generic text (no dashed headers, no headings): optional chunk_generic_rcts if AUSLEGALSEARCH_USE_RCTS_GENERIC=1; otherwise semantic chunker still attempts whole-text sentence merging
+- On chunking failure/timeout: character-window fallback ensures coverage
+
+E) Treaties and journals assessment
+- Provided samples include dashed headers. These flow through chunk_legislation_dashed_semantic:
+  - Treaties: header metadata (type=treaty, title, year, citation, url, jurisdiction, etc.) is attached to all body chunks
+  - Journals: header metadata (type=journal, title, author, year, citation, url, database) is attached similarly
+- No new function is required for these samples. Optional RCTS exists strictly for generic/irregular texts and is off by default (enable via AUSLEGALSEARCH_USE_RCTS_GENERIC=1).
+
+## 8A) Visual chunking decision and workflow (ASCII)
+
+This section provides an end-to-end visual of how files flow through the beta chunking pipeline inside ingest/beta_worker.py, which functions are called, and what metadata is produced. Treaties and journals with dashed headers follow the dashed-header semantic path. Generic texts without dashed headers follow the heading/sentence semantic path, with an optional RCTS fallback.
+
+A) Per-file decision flow (beta_worker.py)
+```
+[beta_worker.run_worker]
+    |
+    v
+[parse_file(.txt/.html)]  -> base_doc.text + base_doc.chunk_metadata
+    |
+    v
+[derive_path_metadata + merge] -> base_meta
+    |
+    v
+[detect_doc_type(meta, text)] -> analytics only (does not control the first attempt)
+    |
+    v
+[Chunk selector]
+    |-- Try 1: chunk_legislation_dashed_semantic(text, base_meta, cfg)
+    |        - Parses dashed header blocks:  ----  key: value ... ---- body
+    |        - For each block, semantically chunks body (sentence-aware, token budgets)
+    |        - Attaches all header key:values to chunk_metadata (e.g., type, title, author, year, citation, url)
+    |        - If chunks produced -> proceed
+    |
+    |-- Else Try 2: chunk_document_semantic(text, base_meta, cfg)
+    |        - Heading-aware blocks (Roman numerals, 1.2.3., UPPERCASE, "Section N")
+    |        - Sentence-based merging to target_tokens with overlap; never exceed max_tokens
+    |        - If chunks produced -> proceed
+    |
+    |-- Else Try 3 (optional): chunk_generic_rcts(text, base_meta, cfg)
+    |        - Enabled when AUSLEGALSEARCH_USE_RCTS_GENERIC=1
+    |        - Uses LangChain RecursiveCharacterTextSplitter:
+    |             * Token-aware (tiktoken) if available; else ~char-based (4 chars ≈ 1 token)
+    |        - If the document begins with a dashed header, its key:value pairs are attached to all chunks
+    |        - Sets chunk_metadata.strategy="rcts-generic", rcts_token_mode flag
+    |        - If chunks produced -> proceed
+    |
+    |-- Else: 0 chunks (very rare)
+    |
+    v
+[Embedder.embed (batched, GPU)]
+    |
+    v
+[_batch_insert_chunks -> Document + Embedding rows, FTS trigger]
+    |
+    v
+[update_session_progress + per-file success/error logs]
+
+On timeout/error during "chunk selector":
+    -> fallback char-window chunker (guarantees coverage)
+```
+
+B) Function map by file shape/type (default paths)
+- Dashed header present (e.g., treaties, many legislation, some journals)
+  - Path: chunk_legislation_dashed_semantic
+  - Metadata: all dashed header fields merged into chunk_metadata (e.g., type, title, author, year, citation, url, database, jurisdiction, etc.)
+- Headed prose without dashed headers (cases, journals, generic legal text)
+  - Path: chunk_document_semantic (heading-aware blocks + sentence merging to token budgets)
+- Highly irregular generic text (no dashed headers, poor headings)
+  - Path: chunk_document_semantic first; if still produces no chunks and AUSLEGALSEARCH_USE_RCTS_GENERIC=1 -> chunk_generic_rcts
+- On chunking failure/timeout (any type)
+  - Path: character-window fallback (AUSLEGALSEARCH_FALLBACK_CHARS_PER_CHUNK, AUSLEGALSEARCH_FALLBACK_OVERLAP_CHARS)
+
+C) Chunk construction details (summary)
+- Token budgets (ChunkingConfig): target_tokens, overlap_tokens, max_tokens; also min_sentence_tokens, min_chunk_tokens
+- Sentence merging: merge sentences up to target_tokens; overlap preserves full sentences up to overlap_tokens; hard-split rare long sentences to never exceed max_tokens
+- Metadata per chunk:
+  - Common: section_title, section_idx, chunk_idx, tokens_est
+  - Dashed-header path: header key:value pairs merged (e.g., type, title, author, year, citation, url)
+  - Path-derived: jurisdiction_guess, rel_path, series_guess, etc.
+  - RCTS generic: strategy="rcts-generic", rcts_token_mode flag
+
+D) Treaties and journals assessment
+- The provided treaty and journal samples both start with dashed headers, so they flow through chunk_legislation_dashed_semantic.
+- No new function is required for these samples. RCTS is optional and off by default; enable via AUSLEGALSEARCH_USE_RCTS_GENERIC=1 only for irregular generic texts.
+
 ## 9) Configuration flags and environment variables
 
 Orchestrator flags (ingest/beta_orchestrator.py):

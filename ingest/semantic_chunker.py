@@ -432,3 +432,120 @@ def chunk_legislation_dashed_semantic(
             })
         sec_idx += 1
     return out
+
+
+# ---- Generic RCTS (Recursive Character/Text) fallback chunker (optional) ----
+
+def _build_rcts_splitter(cfg: Optional[ChunkingConfig]):
+    """
+    Try to build a LangChain RecursiveCharacterTextSplitter.
+
+    Preference order:
+    1) Token-aware splitter via tiktoken (from_tiktoken_encoder) if available.
+    2) Character-based splitter approximating token sizes (4 chars per token heuristic).
+
+    Returns (splitter_or_none, is_token_mode: bool)
+    """
+    cfg = cfg or ChunkingConfig()
+    try:
+        # Newer modular package name (if installed)
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter as _RCTS
+        except Exception:
+            # Fallback to classic import
+            from langchain.text_splitter import RecursiveCharacterTextSplitter as _RCTS  # type: ignore
+
+        # Try token-aware mode first (requires tiktoken or supported tokenizer)
+        try:
+            splitter = _RCTS.from_tiktoken_encoder(
+                chunk_size=int(cfg.target_tokens),
+                chunk_overlap=int(cfg.overlap_tokens),
+            )
+            return splitter, True
+        except Exception:
+            # Fallback to character-based approximating token budgets
+            chunk_size_chars = max(1, int(cfg.target_tokens * 4))
+            overlap_chars = max(0, int(cfg.overlap_tokens * 4))
+            splitter = _RCTS(
+                chunk_size=chunk_size_chars,
+                chunk_overlap=overlap_chars,
+                separators=["\n\n", "\n", " ", ""],
+                length_function=len,
+            )
+            return splitter, False
+    except Exception:
+        # LangChain not installed or failed to import
+        return None, False
+
+
+def chunk_generic_rcts(
+    doc_text: str,
+    base_meta: Optional[Dict] = None,
+    cfg: Optional[ChunkingConfig] = None
+) -> List[Dict]:
+    """
+    Generic fallback chunker using LangChain RecursiveCharacterTextSplitter (if available).
+
+    Behavior:
+    - If an initial dashed header block exists, parse it and treat its key:value pairs
+      as file-level header metadata to attach to ALL produced chunks.
+    - RCTS splitting is applied to the body text after the first dashed header.
+      If no dashed header exists, RCTS is applied to the entire document.
+    - Token budgets:
+        * If tiktoken is available: chunk_size/overlap are in tokens (cfg.target_tokens/overlap_tokens).
+        * Else: approximate via ~4 chars/token for chunk_size/overlap.
+
+    Returns empty list if LangChain is not available, so caller can fall back to
+    chunk_document_semantic or other strategies.
+    """
+    cfg = cfg or ChunkingConfig()
+    splitter, is_token_mode = _build_rcts_splitter(cfg)
+    if splitter is None:
+        # Signal to caller that RCTS is unavailable
+        return []
+
+    text = (doc_text or "").strip()
+    if not text:
+        return []
+
+    # Attempt to parse a single initial dashed header block for metadata
+    header_meta: Dict[str, str] = {}
+    body_text = text
+    try:
+        blocks = parse_dashed_blocks(text)
+        if blocks:
+            # Take the first dashed block as the file-level header
+            header_meta = dict(blocks[0][0] or {})
+            body_text = (blocks[0][1] or "").strip()
+            if not body_text:
+                # If empty body for some reason, revert to full text
+                body_text = text
+    except Exception:
+        # Non-critical; continue without header meta
+        header_meta = {}
+        body_text = text
+
+    # Split using RCTS
+    pieces = splitter.split_text(body_text or "")
+    out: List[Dict] = []
+    sec_title = header_meta.get("title") or header_meta.get("section_title") or header_meta.get("section")
+    for idx, piece in enumerate(pieces):
+        p = (piece or "").strip()
+        if not p:
+            continue
+        md = dict(base_meta or {})
+        if header_meta:
+            md.update(header_meta)
+        md.update({
+            "section_title": sec_title,
+            "section_idx": 0,
+            "chunk_idx": idx,
+            "tokens_est": count_tokens(p),
+            "rcts_token_mode": bool(is_token_mode),
+            "strategy": "rcts-generic"
+        })
+        out.append({
+            "text": p,
+            "chunk_metadata": md
+        })
+    return out

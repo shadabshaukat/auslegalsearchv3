@@ -21,3 +21,5 @@ PyPDF2
 oci
 oracledb
 einops
+langchain-text-splitters
+tiktoken
