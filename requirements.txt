@@ -8,6 +8,7 @@ pydantic
 sentence-transformers
 transformers
 torch
+numpy
 lxml
 rank_bm25
 requests
@@ -15,7 +16,6 @@ bcrypt
 gradio
 uvicorn
 fastapi
-pydantic
 html2text
 PyPDF2
 oci

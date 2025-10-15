@@ -16,6 +16,7 @@ from typing import Iterator, Dict, Any, List, Tuple
 
 from bs4 import BeautifulSoup
 import numpy as np
+from ast import literal_eval
 
 SUPPORTED_EXTS = {'.txt', '.html'}
 
@@ -42,11 +43,14 @@ def extract_metadata_block(text: str) -> tuple[dict, str]:
                 if ":" in l:
                     k, v = l.split(":", 1)
                     k, v = k.strip(), v.strip()
+                    # Safe parsing (no eval):
+                    # - Try Python literals (ints, floats, lists, dicts, booleans, None)
+                    # - If that fails, keep the original string
                     try:
-                        v_eval = eval(v)
-                        chunk_metadata[k] = v_eval
-                    except:
-                        chunk_metadata[k] = v
+                        val = literal_eval(v)
+                    except Exception:
+                        val = v
+                    chunk_metadata[k] = val
             body_text = "\n".join(lines[end_idx+1:]).strip()
             return chunk_metadata, body_text
         except Exception:

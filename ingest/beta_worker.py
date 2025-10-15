@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, DBAPIError
 
 import signal
 import contextlib
@@ -48,6 +49,7 @@ from db.connector import DB_URL
 PARSE_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_PARSE", "60"))
 CHUNK_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_CHUNK", "90"))
 EMBED_BATCH_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_EMBED_BATCH", "180"))
+INSERT_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_INSERT", "120"))
 
 class _Timeout(Exception):
     pass
@@ -342,20 +344,80 @@ def _maybe_print_counts(dbs, session_name: str, label: str) -> None:
 
 def _embed_in_batches(embedder: Embedder, texts: List[str], batch_size: int) -> List:
     """
-    Embed texts in smaller batches to avoid large memory spikes / stalls.
+    Embed texts in smaller batches with adaptive backoff to avoid GPU OOM.
     Returns a list-like of vectors aligned with texts.
     """
     if batch_size <= 0:
         batch_size = 64
     all_vecs = []
-    for i in range(0, len(texts), batch_size):
-        sub = texts[i:i + batch_size]
-        with _deadline(EMBED_BATCH_TIMEOUT):
-            vecs = embedder.embed(sub)  # ndarray [batch, dim]
-        # Extend list with each row (so downstream indexing works)
-        for j in range(vecs.shape[0]):
-            all_vecs.append(vecs[j])
+    i = 0
+    cur_bs = int(batch_size)
+    n = len(texts)
+    while i < n:
+        sub = texts[i:i + cur_bs]
+        try:
+            with _deadline(EMBED_BATCH_TIMEOUT):
+                vecs = embedder.embed(sub)  # ndarray [batch, dim]
+            # Extend list with each row (so downstream indexing works)
+            for j in range(vecs.shape[0]):
+                all_vecs.append(vecs[j])
+            i += cur_bs
+            # Optional: try to grow batch again if it was reduced before (conservative)
+            if cur_bs < batch_size:
+                cur_bs = min(batch_size, max(1, cur_bs * 2))
+        except Exception as e:
+            msg = str(e).lower()
+            if "out of memory" in msg or "cuda" in msg and "memory" in msg:
+                # Adaptive backoff on OOM
+                next_bs = max(1, cur_bs // 2)
+                if next_bs == cur_bs:
+                    # Already at 1; re-raise
+                    raise
+                print(f"[beta_worker] embed OOM/backoff: reducing batch_size {cur_bs} -> {next_bs}", flush=True)
+                cur_bs = next_bs
+                # do not advance i; retry with smaller batch
+                time.sleep(0.5)
+            else:
+                # Non-OOM error: propagate
+                raise
     return all_vecs
+
+
+def _db_insert_with_retry(
+    session,
+    chunks: List[Dict[str, Any]],
+    vectors,
+    source_path: str,
+    fmt: str,
+    max_retries: int = 3
+) -> int:
+    """
+    Insert with per-call deadline and retry on transient DB errors.
+    Rolls back and retries with exponential backoff.
+    """
+    attempt = 0
+    while True:
+        try:
+            with _deadline(INSERT_TIMEOUT):
+                return _batch_insert_chunks(
+                    session=session,
+                    chunks=chunks,
+                    vectors=vectors,
+                    source_path=source_path,
+                    fmt=fmt,
+                )
+        except (OperationalError, DBAPIError) as e:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            if attempt >= max_retries:
+                print(f"[beta_worker] DB insert failed after {max_retries} retries: {e}", flush=True)
+                raise
+            sleep_s = min(8, 2 ** attempt)
+            print(f"[beta_worker] DB insert error, retrying in {sleep_s}s (attempt {attempt+1}/{max_retries}): {e}", flush=True)
+            time.sleep(sleep_s)
+            attempt += 1
 
 def _fallback_chunk_text(text: str, base_meta: Dict[str, Any], cfg: ChunkingConfig) -> List[Dict[str, Any]]:
     """
@@ -549,12 +611,13 @@ def run_worker(
                 # Insert
                 current_stage = "insert"
                 stage_start = time.time()
-                inserted = _batch_insert_chunks(
+                fmt = base_doc.get("format", Path(filepath).suffix.lower().strip("."))
+                inserted = _db_insert_with_retry(
                     session=dbs,
                     chunks=file_chunks,
                     vectors=vecs,
                     source_path=filepath,
-                    fmt=base_doc.get("format", Path(filepath).suffix.lower().strip(".")),
+                    fmt=fmt,
                 )
                 insert_ms = int((time.time() - stage_start) * 1000)
                 processed_chunks += inserted

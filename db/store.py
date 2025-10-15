@@ -8,14 +8,14 @@ from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean, Float
 from sqlalchemy import select, desc, text
 from db.connector import engine, SessionLocal, Vector, JSONB, UUIDType
-from embedding.embedder import Embedder
 from datetime import datetime
 import uuid
 import os
 import bcrypt
 
-embedder = Embedder()
-EMBEDDING_DIM = embedder.dimension
+# Production: avoid loading ML models at import-time in DB module.
+# Use a configured embedding dimension (defaults to 768 for common ST/HF models).
+EMBEDDING_DIM = int(os.environ.get("AUSLEGALSEARCH_EMBED_DIM", "768"))
 
 Base = declarative_base()
 
@@ -152,6 +152,15 @@ def create_all_tables():
         CREATE INDEX IF NOT EXISTS idx_embeddings_vector_ivfflat_cosine
         ON public.embeddings USING ivfflat (vector vector_cosine_ops)
         WITH (lists = 100)
+        """,
+        -- Ensure we never create duplicate session-file rows on retries/resumes
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_esf_session_file
+        ON public.embedding_session_files (session_name, filepath)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_esf_status
+        ON public.embedding_session_files (status)
         """,
     ]
     # Force psql to continue on error for objects already existing

@@ -67,7 +67,41 @@ if not DB_URL:
     pwd_q = quote_plus(DB_PASSWORD)
     DB_URL = f"postgresql+psycopg2://{user_q}:{pwd_q}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-engine = create_engine(DB_URL, pool_pre_ping=True)
+# Production-grade engine config:
+# - pool_pre_ping: avoid stale connections
+# - pool_size/max_overflow: tuneable via env, sensible defaults
+# - pool_recycle: recycle connections periodically to avoid server-side timeouts
+# - pool_timeout: bound waiting time for a free connection
+# - connect_args: psycopg2 keepalives + connect_timeout + optional statement_timeout
+POOL_SIZE = int(os.environ.get("AUSLEGALSEARCH_DB_POOL_SIZE", "10"))
+MAX_OVERFLOW = int(os.environ.get("AUSLEGALSEARCH_DB_MAX_OVERFLOW", "20"))
+POOL_RECYCLE = int(os.environ.get("AUSLEGALSEARCH_DB_POOL_RECYCLE", "1800"))  # seconds
+POOL_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_DB_POOL_TIMEOUT", "30"))    # seconds
+STATEMENT_TIMEOUT_MS = os.environ.get("AUSLEGALSEARCH_DB_STATEMENT_TIMEOUT_MS")  # e.g. "60000"
+
+connect_opts = []
+if STATEMENT_TIMEOUT_MS:
+    # Sets server-side statement timeout for each session
+    connect_opts.append(f"-c statement_timeout={int(STATEMENT_TIMEOUT_MS)}")
+
+engine = create_engine(
+    DB_URL,
+    pool_pre_ping=True,
+    pool_size=POOL_SIZE,
+    max_overflow=MAX_OVERFLOW,
+    pool_recycle=POOL_RECYCLE,
+    pool_timeout=POOL_TIMEOUT,
+    connect_args={
+        "connect_timeout": 10,
+        # TCP keepalives (Linux)
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+        # Server-side options
+        "options": " ".join(connect_opts) if connect_opts else None,
+    },
+)
 SessionLocal = sessionmaker(bind=engine)
 
 from sqlalchemy.dialects.postgresql import UUID as UUIDType, JSONB

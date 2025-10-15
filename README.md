@@ -64,6 +64,84 @@
 
 ---
 
+## Ingestion Pipeline (Beta) — Quickstart
+
+- Multi-GPU orchestrator launches one worker per GPU; each worker:
+  - Parses (.txt/.html), semantic-chunks (with dashed-header support), embeds (GPU), writes to Postgres/pgvector.
+  - Records per-file status in EmbeddingSessionFile for resumable ingestion.
+  - Appends per-file metrics and timings (parse_ms, chunk_ms, embed_ms, insert_ms) to success logs.
+
+Environment variables (core)
+```
+# Postgres
+AUSLEGALSEARCH_DB_HOST=localhost
+AUSLEGALSEARCH_DB_PORT=5432
+AUSLEGALSEARCH_DB_USER=postgres
+AUSLEGALSEARCH_DB_PASSWORD='YourPasswordHere'
+AUSLEGALSEARCH_DB_NAME=postgres
+# Optional: full DSN override
+# AUSLEGALSEARCH_DB_URL='postgresql+psycopg2://user:pass@host:5432/dbname'
+
+# Embedding model and vector dimension
+AUSLEGALSEARCH_EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
+AUSLEGALSEARCH_EMBED_DIM=768
+
+# Worker timeouts and batch size
+AUSLEGALSEARCH_EMBED_BATCH=64
+AUSLEGALSEARCH_TIMEOUT_PARSE=30
+AUSLEGALSEARCH_TIMEOUT_CHUNK=60
+AUSLEGALSEARCH_TIMEOUT_EMBED_BATCH=180
+AUSLEGALSEARCH_TIMEOUT_INSERT=120
+
+# Optional features
+AUSLEGALSEARCH_LOG_METRICS=1
+# AUSLEGALSEARCH_USE_RCTS_GENERIC=1
+```
+
+Production database pooling/timeouts (optional)
+```
+AUSLEGALSEARCH_DB_POOL_SIZE=10
+AUSLEGALSEARCH_DB_MAX_OVERFLOW=20
+AUSLEGALSEARCH_DB_POOL_RECYCLE=1800
+AUSLEGALSEARCH_DB_POOL_TIMEOUT=30
+# AUSLEGALSEARCH_DB_STATEMENT_TIMEOUT_MS=60000
+```
+
+Run orchestrator (full dataset)
+```
+python3 -m ingest.beta_orchestrator \
+  --root "/path/to/Data_for_Beta_Launch" \
+  --session "beta-full-$(date +%Y%m%d-%H%M%S)" \
+  --gpus 4 \
+  --model "nomic-ai/nomic-embed-text-v1.5" \
+  --target_tokens 1500 --overlap_tokens 192 --max_tokens 1920 \
+  --log_dir "/abs/path/to/logs"
+```
+
+Resume a stuck child on “remaining files” only
+```
+session=beta-full-YYYYMMDD-HHMMSS
+child=${session}-gpu3
+proj=/abs/path/auslegalsearchv3
+logs="$proj/logs"
+part=".beta-gpu-partition-${child}.txt"
+
+awk -F'\t' '{print $1}' "$logs/${child}.success.log" 2>/dev/null | sed '/^#/d' > /tmp/processed_g3.txt
+cat "$logs/${child}.error.log" 2>/dev/null >> /tmp/processed_g3.txt
+sort -u /tmp/processed_g3.txt -o /tmp/processed_g3.txt
+sort -u "$part" -o /tmp/partition_g3.txt
+comm -23 /tmp/partition_g3.txt /tmp/processed_g3.txt > "$proj/.beta-gpu-partition-${child}-remaining.txt"
+CUDA_VISIBLE_DEVICES=3 \
+python3 -m ingest.beta_worker ${child}-r1 \
+  --partition_file "$proj/.beta-gpu-partition-${child}-remaining.txt" \
+  --model "nomic-ai/nomic-embed-text-v1.5" \
+  --target_tokens 1500 --overlap_tokens 192 --max_tokens 1920 \
+  --log_dir "$logs"
+```
+
+For full details see docs/BetaDataLoad.md.
+
+
 ## Deployment Instructions
 
 ### 1. System Prerequisites

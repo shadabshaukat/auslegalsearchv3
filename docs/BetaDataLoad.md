@@ -354,6 +354,59 @@ DB & Embed:
 
 ## 9) Configuration flags and environment variables
 
+New/updated environment variables (production hardening)
+- Database connector (db/connector.py):
+  - AUSLEGALSEARCH_DB_POOL_SIZE (default 10)
+  - AUSLEGALSEARCH_DB_MAX_OVERFLOW (default 20)
+  - AUSLEGALSEARCH_DB_POOL_RECYCLE (default 1800 seconds)
+  - AUSLEGALSEARCH_DB_POOL_TIMEOUT (default 30 seconds)
+  - AUSLEGALSEARCH_DB_STATEMENT_TIMEOUT_MS (optional server-side timeout, e.g., 60000)
+- Embedding / vector:
+  - AUSLEGALSEARCH_EMBED_DIM (default 768; must match your embedding model dimension)
+- Worker timeouts:
+  - AUSLEGALSEARCH_TIMEOUT_INSERT (default 120 seconds, per-file DB insert deadline)
+- Logging/optional features (unchanged, clarified):
+  - AUSLEGALSEARCH_LOG_METRICS=1 includes per-file metrics and per-stage timings
+  - AUSLEGALSEARCH_USE_RCTS_GENERIC=1 enables RCTS fallback for generic text
+  - AUSLEGALSEARCH_FALLBACK_CHUNK_ON_TIMEOUT=1 keeps character-window fallback enabled
+
+Resumable ingestion and “remaining files” method
+- If a single GPU child stalls:
+  - Build remaining list by diffing the child’s original partition file against its success and error logs.
+  - Relaunch only that child on remaining files (with a fresh child session name), leaving other GPUs untouched.
+- Example commands:
+  ```
+  session=beta-cases-full-20251014-122557
+  child=${session}-gpu3
+  proj=/home/ubuntu/auslegalsearchv3/auslegalsearchv3
+  logs="$proj/logs"
+  part=".beta-gpu-partition-${child}.txt"
+
+  awk -F'\t' '{print $1}' "$logs/${child}.success.log" 2>/dev/null | sed '/^#/d' > /tmp/processed_g3.txt
+  cat "$logs/${child}.error.log" 2>/dev/null >> /tmp/processed_g3.txt
+  sort -u /tmp/processed_g3.txt -o /tmp/processed_g3.txt
+
+  sort -u "$part" -o /tmp/partition_g3.txt
+  comm -23 /tmp/partition_g3.txt /tmp/processed_g3.txt > "$proj/.beta-gpu-partition-${child}-remaining.txt"
+  wc -l "$proj/.beta-gpu-partition-${child}-remaining.txt"
+
+  pgrep -fa "ingest.beta_worker" | grep "${child}"
+  kill -TERM <PID_of_${child}>; sleep 10
+  pgrep -fa "ingest.beta_worker" | grep "${child}" && kill -KILL <PID_of_${child}>
+
+  export AUSLEGALSEARCH_TIMEOUT_PARSE=30
+  export AUSLEGALSEARCH_TIMEOUT_CHUNK=60
+  export AUSLEGALSEARCH_TIMEOUT_EMBED_BATCH=180
+  export AUSLEGALSEARCH_TIMEOUT_INSERT=120
+
+  CUDA_VISIBLE_DEVICES=3 \
+  python3 -m ingest.beta_worker ${child}-r1 \
+    --partition_file "$proj/.beta-gpu-partition-${child}-remaining.txt" \
+    --model "nomic-ai/nomic-embed-text-v1.5" \
+    --target_tokens 1500 --overlap_tokens 192 --max_tokens 1920 \
+    --log_dir "$logs"
+  ```
+
 Orchestrator flags (ingest/beta_orchestrator.py):
 - --root (required): dataset root directory
 - --session (required): base session name; child sessions are {session}-gpu0, {session}-gpu1, ...
