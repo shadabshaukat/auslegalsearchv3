@@ -153,7 +153,7 @@ def create_all_tables():
         ON public.embeddings USING ivfflat (vector vector_cosine_ops)
         WITH (lists = 100)
         """,
-        -- Ensure we never create duplicate session-file rows on retries/resumes
+        # Ensure we never create duplicate session-file rows on retries/resumes
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_esf_session_file
         ON public.embedding_session_files (session_name, filepath)
