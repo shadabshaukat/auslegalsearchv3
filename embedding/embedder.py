@@ -69,6 +69,8 @@ class Embedder:
         flags = os.environ.get("AUSLEGALSEARCH_EMBEDDER_FLAGS", "")
         if "trust_remote_code" in flags or ("nomic-ai" in resolved):
             trust_remote = True
+        if os.environ.get("AUSLEGALSEARCH_TRUST_REMOTE_CODE", "0") == "1":
+            trust_remote = True
 
         # Try SentenceTransformer path first (if available)
         if SentenceTransformer is not None:
@@ -77,24 +79,24 @@ class Embedder:
                 self.dimension = int(self._st_model.get_sentence_embedding_dimension())
             except Exception as e:
                 warnings.warn(f"SentenceTransformer load failed for '{resolved}', falling back to HF: {e}")
-                self._init_hf_fallback(resolved)
+                self._init_hf_fallback(resolved, trust_remote)
         else:
             # No ST installed; go straight to HF fallback
-            self._init_hf_fallback(resolved)
+            self._init_hf_fallback(resolved, trust_remote)
 
         # Final sanity check
         if self.dimension is None:
             raise RuntimeError(f"Could not determine embedding dimension for model '{resolved}'")
 
-    def _init_hf_fallback(self, model_name: str):
+    def _init_hf_fallback(self, model_name: str, trust_remote: bool = False):
         """
         Initialize HuggingFace AutoModel fallback with mean pooling.
         Works for plain encoder checkpoints like 'legal-bert-base-uncased'.
         """
         _ensure_hf_imports()
         try:
-            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self._hf_model = AutoModel.from_pretrained(model_name)
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote)
+            self._hf_model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote)
             # BERT-base hidden size is typically 768; grab from config
             hidden = getattr(self._hf_model.config, "hidden_size", None)
             if hidden is None:
