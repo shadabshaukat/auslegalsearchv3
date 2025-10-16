@@ -50,6 +50,8 @@ PARSE_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_PARSE", "60"))
 CHUNK_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_CHUNK", "90"))
 EMBED_BATCH_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_EMBED_BATCH", "180"))
 INSERT_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_INSERT", "120"))
+SELECT_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_SELECT", "30"))
+DB_MAX_RETRIES = int(os.environ.get("AUSLEGALSEARCH_DB_MAX_RETRIES", "3"))
 
 class _Timeout(Exception):
     pass
@@ -389,7 +391,7 @@ def _db_insert_with_retry(
     vectors,
     source_path: str,
     fmt: str,
-    max_retries: int = 3
+    max_retries: int = DB_MAX_RETRIES
 ) -> int:
     """
     Insert with per-call deadline and retry on transient DB errors.
@@ -416,6 +418,70 @@ def _db_insert_with_retry(
                 raise
             sleep_s = min(8, 2 ** attempt)
             print(f"[beta_worker] DB insert error, retrying in {sleep_s}s (attempt {attempt+1}/{max_retries}): {e}", flush=True)
+            time.sleep(sleep_s)
+            attempt += 1
+
+
+def _db_get_esf_with_retry(
+    session,
+    session_name: str,
+    filepath: str,
+    select_timeout: int = SELECT_TIMEOUT,
+    max_retries: int = DB_MAX_RETRIES
+) -> Optional[EmbeddingSessionFile]:
+    """
+    Fetch EmbeddingSessionFile row with a bounded deadline and retries on transient DB errors.
+    """
+    attempt = 0
+    while True:
+        try:
+            with _deadline(select_timeout):
+                return session.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
+        except (OperationalError, DBAPIError, _Timeout) as e:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            if attempt >= max_retries:
+                print(f"[beta_worker] DB select failed after {max_retries} retries for file: {filepath} :: {e}", flush=True)
+                raise
+            sleep_s = min(8, 2 ** attempt)
+            print(f"[beta_worker] DB select error, retrying in {sleep_s}s (attempt {attempt+1}/{max_retries}): {e}", flush=True)
+            time.sleep(sleep_s)
+            attempt += 1
+
+
+def _db_ensure_pending_esf(
+    session,
+    session_name: str,
+    filepath: str,
+    max_retries: int = DB_MAX_RETRIES
+) -> EmbeddingSessionFile:
+    """
+    Ensure there is a row for (session_name, filepath). If missing, insert with status='pending'.
+    Handles unique constraint races by re-reading the row.
+    """
+    attempt = 0
+    while True:
+        esf = _db_get_esf_with_retry(session, session_name, filepath)
+        if esf:
+            return esf
+        try:
+            esf = EmbeddingSessionFile(session_name=session_name, filepath=filepath, status="pending")
+            session.add(esf)
+            session.commit()
+            return esf
+        except (OperationalError, DBAPIError) as e:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            # Unique violation or transient error; re-read on next loop
+            if attempt >= max_retries:
+                print(f"[beta_worker] DB insert (pending) failed after {max_retries} retries for file: {filepath} :: {e}", flush=True)
+                raise
+            sleep_s = min(8, 2 ** attempt)
+            print(f"[beta_worker] DB insert (pending) error, retrying in {sleep_s}s (attempt {attempt+1}/{max_retries}): {e}", flush=True)
             time.sleep(sleep_s)
             attempt += 1
 
@@ -514,17 +580,16 @@ def run_worker(
         _maybe_print_counts(dbs, session_name, "baseline")
         for idx_f, filepath in enumerate(files, start=1):
             try:
-                # Track per-file status row (create if missing; will update on completion)
-                esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=filepath).first()
-                if not esf:
-                    esf = EmbeddingSessionFile(session_name=session_name, filepath=filepath, status="pending")
-                    dbs.add(esf)
-                    dbs.commit()
-                elif getattr(esf, "status", None) == "complete":
-                    # Skip already-completed files to support safe resume
+                # Track per-file status row with bounded DB deadlines/retries (prevents hangs before 'parse')
+                esf = _db_get_esf_with_retry(dbs, session_name, filepath)
+                if esf and getattr(esf, "status", None) == "complete":
                     if idx_f % 200 == 0:
                         print(f"[beta_worker] {session_name}: SKIP already complete {idx_f}/{total_files} -> {filepath}", flush=True)
                     continue
+                if not esf:
+                    esf = _db_ensure_pending_esf(dbs, session_name, filepath)
+                # Announce the start of active processing for this file (helps identify a stuck file quickly)
+                print(f"[beta_worker] {session_name}: start {idx_f}/{total_files} -> {filepath}", flush=True)
 
                 current_stage = "parse"
                 stage_start = time.time()
