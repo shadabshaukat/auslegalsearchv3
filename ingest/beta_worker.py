@@ -593,10 +593,12 @@ def run_worker(
 
                 current_stage = "parse"
                 stage_start = time.time()
+                print(f"[beta_worker] {session_name}: parse start -> {filepath}", flush=True)
                 with _deadline(PARSE_TIMEOUT):
                     base_doc = parse_file(filepath)
                 current_text_len = len(base_doc.get("text", ""))
                 parse_ms = int((time.time() - stage_start) * 1000)
+                print(f"[beta_worker] {session_name}: parse done {parse_ms}ms len={current_text_len}", flush=True)
                 if not base_doc or not base_doc.get("text"):
                     esf.status = "error"
                     dbs.commit()
@@ -624,6 +626,7 @@ def run_worker(
                 # Semantic chunking
                 current_stage = "chunk"
                 stage_start = time.time()
+                print(f"[beta_worker] {session_name}: chunk start", flush=True)
                 with _deadline(CHUNK_TIMEOUT):
                     # Try dashed-header aware chunking first (works for any dashed-header format).
                     file_chunks = chunk_legislation_dashed_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
@@ -642,6 +645,7 @@ def run_worker(
                             chunk_strategy = "rcts-generic"
                 current_chunk_count = len(file_chunks)
                 chunk_ms = int((time.time() - stage_start) * 1000)
+                print(f"[beta_worker] {session_name}: chunk done {chunk_ms}ms chunks={current_chunk_count}", flush=True)
                 if not file_chunks:
                     esf.status = "complete"
                     dbs.commit()
@@ -670,13 +674,16 @@ def run_worker(
                 texts = [c["text"] for c in file_chunks]
                 current_stage = "embed"
                 stage_start = time.time()
+                print(f"[beta_worker] {session_name}: embed start batch={batch_size} texts={len(texts)}", flush=True)
                 vecs = _embed_in_batches(embedder, texts, batch_size=batch_size)
                 embed_ms = int((time.time() - stage_start) * 1000)
+                print(f"[beta_worker] {session_name}: embed done {embed_ms}ms", flush=True)
 
                 # Insert
                 current_stage = "insert"
                 stage_start = time.time()
                 fmt = base_doc.get("format", Path(filepath).suffix.lower().strip("."))
+                print(f"[beta_worker] {session_name}: insert start", flush=True)
                 inserted = _db_insert_with_retry(
                     session=dbs,
                     chunks=file_chunks,
@@ -685,12 +692,17 @@ def run_worker(
                     fmt=fmt,
                 )
                 insert_ms = int((time.time() - stage_start) * 1000)
+                print(f"[beta_worker] {session_name}: insert done {insert_ms}ms rows={inserted}", flush=True)
                 processed_chunks += inserted
 
                 # Update progress
                 esf.status = "complete"
                 dbs.commit()
-                update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
+                try:
+                    with _deadline(SELECT_TIMEOUT):
+                        update_session_progress(session_name, last_file=filepath, last_chunk=inserted - 1, processed_chunks=processed_chunks)
+                except _Timeout:
+                    print(f"[beta_worker] {session_name}: progress update timeout for {filepath}", flush=True)
                 successes.append(filepath)
                 # Compute light-weight per-file metrics for logging (O(n) in chunks; negligible vs embedding)
                 try:
