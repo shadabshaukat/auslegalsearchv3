@@ -71,11 +71,23 @@ class Embedder:
             trust_remote = True
         if os.environ.get("AUSLEGALSEARCH_TRUST_REMOTE_CODE", "0") == "1":
             trust_remote = True
+        # Optional: pin revision and run offline from local cache
+        rev = os.environ.get("AUSLEGALSEARCH_EMBED_REV", None)
+        local_only = os.environ.get("AUSLEGALSEARCH_HF_LOCAL_ONLY", "0") == "1"
 
         # Try SentenceTransformer path first (if available)
         if SentenceTransformer is not None:
             try:
-                self._st_model = SentenceTransformer(resolved, trust_remote_code=trust_remote)
+                st_kwargs = {"trust_remote_code": trust_remote}
+                if rev:
+                    st_kwargs["revision"] = rev
+                if local_only:
+                    st_kwargs["local_files_only"] = True
+                try:
+                    self._st_model = SentenceTransformer(resolved, **st_kwargs)
+                except TypeError:
+                    # Older sentence_transformers versions may not support revision/local_files_only
+                    self._st_model = SentenceTransformer(resolved, trust_remote_code=trust_remote)
                 self.dimension = int(self._st_model.get_sentence_embedding_dimension())
             except Exception as e:
                 warnings.warn(f"SentenceTransformer load failed for '{resolved}', falling back to HF: {e}")
@@ -95,8 +107,10 @@ class Embedder:
         """
         _ensure_hf_imports()
         try:
-            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote)
-            self._hf_model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote)
+            rev = os.environ.get("AUSLEGALSEARCH_EMBED_REV", None)
+            local_only = os.environ.get("AUSLEGALSEARCH_HF_LOCAL_ONLY", "0") == "1"
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote, revision=rev, local_files_only=local_only)
+            self._hf_model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote, revision=rev, local_files_only=local_only)
             # BERT-base hidden size is typically 768; grab from config
             hidden = getattr(self._hf_model.config, "hidden_size", None)
             if hidden is None:
