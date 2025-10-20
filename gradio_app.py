@@ -3,12 +3,28 @@ AUSLegalSearchv3 Gradio UI:
 - Tabs for Hybrid Search, Vector Search, RAG (with supersystem prompt), Conversational Chat, and Agentic Chat (chain-of-thought for both Ollama and OCI GenAI).
 """
 
+# Always load .env if present (so AUTO_DDL and DB_* vars are available even if shell didn't export them)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 import gradio as gr
 import requests
 import os
 import html
 import json
 import re
+
+from db.store import create_all_tables
+# Ensure DB schema on UI startup when enabled
+if os.environ.get("AUSLEGALSEARCH_AUTO_DDL", "1") == "1":
+    try:
+        create_all_tables()
+        print("[gradio] DB schema ensured (AUTO_DDL=1)")
+    except Exception as e:
+        print(f"[gradio] DB schema ensure failed: {e}")
 
 API_ROOT = os.environ.get("AUSLEGALSEARCH_API_URL", "http://localhost:8000")
 SESS = type("Session", (), {"user": None, "auth": None})()

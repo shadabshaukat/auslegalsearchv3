@@ -22,7 +22,7 @@ from db.store import (
     create_user, get_user_by_email, hash_password, check_password,
     add_document, add_embedding, start_session, get_session, complete_session, fail_session, update_session_progress,
     search_vector, search_bm25, search_hybrid, get_chat_session, save_chat_session,
-    get_active_sessions, get_resume_sessions, search_fts
+    get_active_sessions, get_resume_sessions, search_fts, create_all_tables
 )
 from embedding.embedder import Embedder
 from rag.rag_pipeline import RAGPipeline, list_ollama_models
@@ -73,6 +73,16 @@ app = FastAPI(
     description="REST API for legal vector search, ingestion, RAG, chat, reranker, system prompt, OCI GenAI, and Oracle 23ai DB.",
     version="0.40"
 )
+
+# Ensure DB schema on API startup when enabled
+@app.on_event("startup")
+async def _bootstrap_db_schema():
+    if os.environ.get("AUSLEGALSEARCH_AUTO_DDL", "1") == "1":
+        try:
+            create_all_tables()
+            print("[fastapi] DB schema ensured (AUTO_DDL=1)")
+        except Exception as e:
+            print(f"[fastapi] DB schema ensure failed: {e}")
 
 security = HTTPBasic()
 def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
