@@ -12,6 +12,7 @@ numpy
 lxml
 rank_bm25
 requests
+regex
 bcrypt
 gradio
 uvicorn

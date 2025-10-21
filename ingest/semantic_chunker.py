@@ -9,13 +9,29 @@ Design goals:
 - Strict guarantees: chunk size never exceeds max_tokens after final splitting.
 
 This module is standalone (no DB), focused purely on chunking logic.
+
+Safety hardening:
+- Uses the third-party 'regex' module (if installed) with per-call timeouts to avoid catastrophic backtracking hangs.
+- Controlled by AUSLEGALSEARCH_REGEX_TIMEOUT_MS (default 200ms per regex operation).
+- If timeout occurs in dashed-header parsing or sentence splitting, falls back to simplified, safe logic.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, List, Dict, Tuple, Optional
+
+# Optional: safer regex engine with timeouts (pip install regex)
+try:
+    import regex as _re2  # type: ignore
+except Exception:
+    _re2 = None  # Fallback to stdlib re without timeouts
+
+# Timeout (ms) for individual regex operations when using 'regex' module
+_REGEX_TIMEOUT_MS = int(os.environ.get("AUSLEGALSEARCH_REGEX_TIMEOUT_MS", "200"))
+_REGEX_TIMEOUT_S = max(0.01, _REGEX_TIMEOUT_MS / 1000.0)  # seconds; clamp to sane minimum
 
 # Defaults tuned to common LLM context windows and RAG best-practices
 DEFAULT_TARGET_TOKENS = 512
@@ -25,7 +41,13 @@ DEFAULT_MAX_TOKENS = 640  # safety upper bound
 
 # ---- Tokenization and basic text utilities ----
 
-_WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+# Prefer regex module with timeout-capable compiled patterns where applicable
+def _compile(pattern: str, flags: int = 0):
+    if _re2 is not None:
+        return _re2.compile(pattern, flags)
+    return re.compile(pattern, flags)
+
+_WORD_RE = _compile(r"\w+|[^\w\s]")
 
 def tokenize_rough(text: str) -> List[str]:
     """
@@ -41,7 +63,7 @@ def count_tokens(text: str) -> int:
 # ---- Structural segmentation helpers ----
 
 # Headings: Roman numerals / numbered / uppercase words / legal "Section" markers
-_HEADING_LINE_RE = re.compile(
+_HEADING_LINE_RE = _compile(
     r"""
     ^\s*(
         (?:[IVXLCDM]+\.?)                                  # Roman numerals
@@ -53,16 +75,24 @@ _HEADING_LINE_RE = re.compile(
     re.VERBOSE,
 )
 
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
+_SENT_SPLIT_RE = _compile(r"(?<=[.!?])\s+(?=[A-Z(])")
 
 def split_into_sentences(text: str) -> List[str]:
     """
     Conservative sentence splitter. Avoids over-splitting abbreviations by requiring next token capital/opening bracket.
+    With 'regex' installed, enforces a small timeout per split to avoid catastrophic backtracking.
     """
     text = (text or "").strip()
     if not text:
         return []
-    parts = _SENT_SPLIT_RE.split(text)
+    try:
+        if _re2 is not None and isinstance(_SENT_SPLIT_RE, _re2.Pattern):  # type: ignore[attr-defined]
+            parts = _SENT_SPLIT_RE.split(text, timeout=_REGEX_TIMEOUT_S)  # type: ignore[arg-type]
+        else:
+            parts = _SENT_SPLIT_RE.split(text)
+    except Exception:
+        # Fallback: simple heuristic split on period + space
+        parts = re.split(r"\.\s+", text)
     out = []
     for p in parts:
         p = p.strip()
@@ -74,7 +104,14 @@ def split_into_paragraphs(text: str) -> List[str]:
     """
     Split on blank lines and normalize whitespace.
     """
-    paras = [p.strip() for p in re.split(r"(?:\r?\n){2,}", text or "") if p.strip()]
+    try:
+        if _re2 is not None:
+            parts = _re2.split(r"(?:\r?\n){2,}", text or "", timeout=_REGEX_TIMEOUT_S)  # type: ignore[attr-defined]
+        else:
+            parts = re.split(r"(?:\r?\n){2,}", text or "")
+    except Exception:
+        parts = (text or "").split("\n\n")
+    paras = [p.strip() for p in parts if p.strip()]
     return paras
 
 def split_into_blocks(text: str) -> List[Tuple[str, Optional[str]]]:
@@ -103,7 +140,17 @@ def split_into_blocks(text: str) -> List[Tuple[str, Optional[str]]]:
                 current_accum.append("")  # keep a blank to mark paragraph split
             continue
 
-        if _HEADING_LINE_RE.match(ln.strip()):
+        is_heading = False
+        try:
+            if _re2 is not None and isinstance(_HEADING_LINE_RE, _re2.Pattern):  # type: ignore[attr-defined]
+                is_heading = _HEADING_LINE_RE.match(ln.strip(), timeout=_REGEX_TIMEOUT_S) is not None  # type: ignore[arg-type]
+            else:
+                is_heading = _HEADING_LINE_RE.match(ln.strip()) is not None
+        except Exception:
+            # On matcher failure, treat as non-heading
+            is_heading = False
+
+        if is_heading:
             # heading encountered -> flush previous
             flush_block()
             current_heading = ln.strip()
@@ -115,10 +162,20 @@ def split_into_blocks(text: str) -> List[Tuple[str, Optional[str]]]:
     flush_block()
     # Post-process: split any block on consecutive blanks to form tighter paragraph blocks
     refined: List[Tuple[str, Optional[str]]] = []
-    for text_block, heading in blocks:
-        parts = [p.strip() for p in re.split(r"(?:\r?\n){2,}", text_block) if p.strip()]
-        for p in parts:
-            refined.append((p, heading))
+    try:
+        splitter = _re2 if _re2 is not None else re
+        parts_list = []
+        for text_block, heading in blocks:
+            parts = splitter.split(r"(?:\r?\n){2,}", text_block) if splitter is re else splitter.split(r"(?:\r?\n){2,}", text_block, timeout=_REGEX_TIMEOUT_S)  # type: ignore
+            parts_list.append((parts, heading))
+        for parts, heading in parts_list:
+            for p in parts:
+                p = p.strip()
+                if p:
+                    refined.append((p, heading))
+    except Exception:
+        # Fallback: keep the original blocks if paragraph split fails
+        refined = blocks[:]
     return refined
 
 
@@ -267,10 +324,14 @@ def detect_doc_type(meta: Optional[Dict], text: str) -> str:
     sample = (text or "")[:1000].lower()
     if " v " in sample or " appellant" in sample or " respondent" in sample:
         return "case"
-    if " section " in sample or re.search(r"\bs\.\s*\d+", sample):
-        return "legislation"
-    if re.search(r"^(?:[ivxlcdm]+\.)|^\d+\.", (text or "").strip().lower(), re.M):
-        return "journal"
+    try:
+        # simple heuristics; guard with try/except to avoid regex failures affecting flow
+        if " section " in sample or re.search(r"\bs\.\s*\d+", sample):
+            return "legislation"
+        if re.search(r"^(?:[ivxlcdm]+\.)|^\d+\.", (text or "").strip().lower(), re.M):
+            return "journal"
+    except Exception:
+        pass
     return "txt"
 
 def chunk_document_semantic(
@@ -315,7 +376,7 @@ def chunk_document_semantic(
 
 # ---- Legislation dashed-header block parsing and chunking (for beta pipeline) ----
 
-_DASH_LINE_RE = re.compile(r"^\s*-{3,}\s*$", re.M)
+_DASH_LINE_RE = _compile(r"^\s*-{3,}\s*$", re.M)
 
 def _parse_dashed_header(header_text: str) -> Dict[str, str]:
     """
@@ -338,42 +399,95 @@ def _parse_dashed_header(header_text: str) -> Dict[str, str]:
 def parse_dashed_blocks(doc_text: str) -> List[Tuple[Dict[str, str], str]]:
     """
     Extract repeated dashed-header sections:
-      -----\n
-      key: value\n
-      key: value\n
-      -----\n
+      -----\\n
+      key: value\\n
+      key: value\\n
+      -----\\n
       <body until next dashed header or EOF>
+
     Returns list of (header_meta_dict, body_text).
+
+    Timeout-safe implementation:
+    - Uses 'regex' with timeout when available.
+    - On timeout, falls back to a deterministic manual parser based on dashed-line positions.
     """
     text = doc_text or ""
     if not text.strip():
         return []
 
-    # Strategy: find all dashed lines and slice segments between them
-    # Expect pattern: DASH, header, DASH, body, (repeat)
-    positions = [m.start() for m in _DASH_LINE_RE.finditer(text)]
-    if not positions:
+    # Pattern-based capture first (best effort with timeout)
+    try:
+        if _re2 is not None:
+            pattern = _re2.compile(
+                r"^\s*-{3,}\s*$\s*"
+                r"(?P<header>.*?)"
+                r"^\s*-{3,}\s*$\s*"
+                r"(?P<body>.*?)(?=^\s*-{3,}\s*$|\Z)",
+                _re2.M | _re2.S,
+            )
+            blocks: List[Tuple[Dict[str, str], str]] = []
+            for m in pattern.finditer(text, timeout=_REGEX_TIMEOUT_S):  # type: ignore
+                header_text = m.group("header") or ""
+                body = (m.group("body") or "").strip()
+                meta = _parse_dashed_header(header_text)
+                if meta and body:
+                    blocks.append((meta, body))
+            if blocks:
+                return blocks
+        else:
+            # stdlib re (no timeout)
+            pattern = re.compile(
+                r"^\s*-{3,}\s*$\s*"
+                r"(?P<header>.*?)"
+                r"^\s*-{3,}\s*$\s*"
+                r"(?P<body>.*?)(?=^\s*-{3,}\s*$|\Z)",
+                re.M | re.S,
+            )
+            blocks = []
+            for m in pattern.finditer(text):
+                header_text = m.group("header") or ""
+                body = (m.group("body") or "").strip()
+                meta = _parse_dashed_header(header_text)
+                if meta and body:
+                    blocks.append((meta, body))
+            if blocks:
+                return blocks
+    except Exception:
+        # Fallthrough to manual parser below
+        pass
+
+    # Manual parser based on dashed line positions (robust, no backtracking)
+    try:
+        if _re2 is not None and isinstance(_DASH_LINE_RE, _re2.Pattern):  # type: ignore[attr-defined]
+            dashes = list(_DASH_LINE_RE.finditer(text, timeout=_REGEX_TIMEOUT_S))  # type: ignore[arg-type]
+        else:
+            dashes = list(_DASH_LINE_RE.finditer(text))
+        if not dashes:
+            return []
+
+        # Expect pairs of dashed lines: [dash1, dash2] header between, body until next dash or EOF
+        # We'll scan sequentially and build blocks
+        blocks: List[Tuple[Dict[str, str], str]] = []
+        i = 0
+        L = len(dashes)
+        while i + 1 < L:
+            d1 = dashes[i]
+            d2 = dashes[i + 1]
+            header_text = text[d1.end():d2.start()]
+            # Body from end of d2 to next dash (d3.start) or to end
+            if i + 2 < L:
+                d3 = dashes[i + 2]
+                body = text[d2.end():d3.start()]
+            else:
+                body = text[d2.end():]
+            header_meta = _parse_dashed_header(header_text or "")
+            body = (body or "").strip()
+            if header_meta and body:
+                blocks.append((header_meta, body))
+            i += 2
+        return blocks
+    except Exception:
         return []
-
-    # Build a regex to capture blocks robustly:
-    # (DASH header DASH) body (up to next DASH or end)
-    pattern = re.compile(
-        r"^\s*-{3,}\s*$\s*"
-        r"(?P<header>.*?)"
-        r"^\s*-{3,}\s*$\s*"
-        r"(?P<body>.*?)(?=^\s*-{3,}\s*$|\Z)",
-        re.M | re.S
-    )
-
-    blocks: List[Tuple[Dict[str, str], str]] = []
-    for m in pattern.finditer(text):
-        header_text = m.group("header") or ""
-        body = (m.group("body") or "").strip()
-        meta = _parse_dashed_header(header_text)
-        # Only consider as a dashed block if at least one key:value was parsed
-        if meta and body:
-            blocks.append((meta, body))
-    return blocks
 
 def chunk_legislation_dashed_semantic(
     doc_text: str,
@@ -398,7 +512,10 @@ def chunk_legislation_dashed_semantic(
     sec_idx = 0
     # Include any preface text that appears before the first dashed header (e.g., body of an initial header removed upstream)
     try:
-        m_first = _DASH_LINE_RE.search(doc_text or "")
+        if _re2 is not None and isinstance(_DASH_LINE_RE, _re2.Pattern):  # type: ignore[attr-defined]
+            m_first = _DASH_LINE_RE.search(doc_text or "", timeout=_REGEX_TIMEOUT_S)  # type: ignore[arg-type]
+        else:
+            m_first = _DASH_LINE_RE.search(doc_text or "")
         if m_first:
             preface = (doc_text or "")[: m_first.start()].strip()
             if preface:
