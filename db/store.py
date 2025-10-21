@@ -372,6 +372,8 @@ def search_bm25(query, top_k=5):
         return hits
 
 def search_hybrid(query, top_k=5, alpha=0.5):
+    # Lazy import to avoid heavy model load at module import-time
+    from embedding.embedder import Embedder
     embedder = Embedder()
     query_vec = embedder.embed([query])[0]
     vector_hits = search_vector(query_vec, top_k=top_k * 2)

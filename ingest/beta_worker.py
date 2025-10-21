@@ -33,6 +33,8 @@ import signal
 import contextlib
 import json
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import deque
 
 from ingest.loader import parse_txt, parse_html
 from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type, chunk_legislation_dashed_semantic, chunk_generic_rcts
@@ -52,6 +54,16 @@ EMBED_BATCH_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_EMBED_BATCH", "
 INSERT_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_INSERT", "120"))
 SELECT_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_SELECT", "30"))
 DB_MAX_RETRIES = int(os.environ.get("AUSLEGALSEARCH_DB_MAX_RETRIES", "3"))
+
+# CPU parallelism for parse+chunk stage and prefetch buffer
+_CORES = os.cpu_count() or 2
+# 0 or unset -> auto: min(cores-1, 8), at least 1
+CPU_WORKERS = int(os.environ.get("AUSLEGALSEARCH_CPU_WORKERS", "0"))
+if CPU_WORKERS <= 0:
+    CPU_WORKERS = max(1, min(8, _CORES - 1))
+PIPELINE_PREFETCH = int(os.environ.get("AUSLEGALSEARCH_PIPELINE_PREFETCH", "0"))
+if PIPELINE_PREFETCH <= 0:
+    PIPELINE_PREFETCH = 64
 
 class _Timeout(Exception):
     pass
@@ -515,6 +527,411 @@ def _fallback_chunk_text(text: str, base_meta: Dict[str, Any], cfg: ChunkingConf
     return chunks
 
 
+def _cpu_prepare_file(
+    filepath: str,
+    root_dir: Optional[str],
+    token_target: int,
+    token_overlap: int,
+    token_max: int,
+) -> Dict[str, Any]:
+    """
+    CPU-bound task: parse file and produce chunk list + per-file metrics.
+    Runs in a separate process. Never touches DB or GPU.
+    Returns:
+      {
+        "filepath": str,
+        "status": "ok"|"empty"|"zero_chunks"|"fallback_ok"|"error",
+        "error": str (optional),
+        "chunks": List[{"text":..., "chunk_metadata": {...}}] (optional),
+        "text_len": int,
+        "chunk_count": int,
+        "detected_type": Optional[str],
+        "chunk_strategy": str ("dashed-semantic"|"semantic"|"rcts-generic"|"fallback-naive"|"no-chunks"),
+        "section_count": Optional[int],
+        "tokens_est_total": Optional[int],
+        "tokens_est_mean": Optional[int],
+        "parse_ms": Optional[int],
+        "chunk_ms": Optional[int],
+      }
+    """
+    try:
+        t0 = time.time()
+        # Parse
+        with _deadline(PARSE_TIMEOUT):
+            base_doc = parse_file(filepath)
+        text_len = len(base_doc.get("text", "") or "")
+        parse_ms = int((time.time() - t0) * 1000)
+        if not base_doc or not base_doc.get("text"):
+            return {
+                "filepath": filepath,
+                "status": "empty",
+                "text_len": 0,
+                "chunk_count": 0,
+                "chunk_strategy": "no-chunks",
+                "parse_ms": parse_ms,
+                "chunk_ms": None,
+            }
+
+        # Build base metadata
+        path_meta = derive_path_metadata(filepath, root_dir or "")
+        base_meta = dict(base_doc.get("chunk_metadata") or {})
+        base_meta.update(path_meta)
+
+        detected_type = detect_doc_type(base_meta, base_doc.get("text", ""))
+
+        # Chunk
+        cfg = ChunkingConfig(
+            target_tokens=int(token_target),
+            overlap_tokens=int(token_overlap),
+            max_tokens=int(token_max),
+        )
+        chunk_strategy = None
+        t1 = time.time()
+        with _deadline(CHUNK_TIMEOUT):
+            # Try dashed first
+            file_chunks = chunk_legislation_dashed_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+            if file_chunks:
+                chunk_strategy = "dashed-semantic"
+            else:
+                # Then semantic
+                file_chunks = chunk_document_semantic(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                if file_chunks:
+                    chunk_strategy = "semantic"
+            # Optional RCTS fallback
+            if (not file_chunks) and os.environ.get("AUSLEGALSEARCH_USE_RCTS_GENERIC", "0") == "1":
+                rcts_chunks = chunk_generic_rcts(base_doc["text"], base_meta=base_meta, cfg=cfg)
+                if rcts_chunks:
+                    file_chunks = rcts_chunks
+                    chunk_strategy = "rcts-generic"
+        chunk_ms = int((time.time() - t1) * 1000)
+
+        if not file_chunks:
+            return {
+                "filepath": filepath,
+                "status": "zero_chunks",
+                "text_len": text_len,
+                "chunk_count": 0,
+                "detected_type": detected_type,
+                "chunk_strategy": chunk_strategy or "no-chunks",
+                "parse_ms": parse_ms,
+                "chunk_ms": chunk_ms,
+            }
+
+        # Compute light metrics
+        section_idxs = set()
+        token_vals = []
+        for c in file_chunks:
+            md = c.get("chunk_metadata") or {}
+            if isinstance(md, dict):
+                si = md.get("section_idx")
+                if si is not None:
+                    section_idxs.add(si)
+                tv = md.get("tokens_est")
+                if isinstance(tv, int):
+                    token_vals.append(tv)
+        section_count = len(section_idxs) if section_idxs else 0
+        tokens_est_total = sum(token_vals) if token_vals else None
+        tokens_est_mean = int(round(tokens_est_total / len(token_vals))) if token_vals else None
+
+        return {
+            "filepath": filepath,
+            "status": "ok",
+            "chunks": file_chunks,
+            "text_len": text_len,
+            "chunk_count": len(file_chunks),
+            "detected_type": detected_type,
+            "chunk_strategy": chunk_strategy or "semantic",
+            "section_count": section_count,
+            "tokens_est_total": tokens_est_total,
+            "tokens_est_mean": tokens_est_mean,
+            "parse_ms": parse_ms,
+            "chunk_ms": chunk_ms,
+        }
+    except _Timeout:
+        # Fallback-naive on chunking timeout (parse succeeded)
+        try:
+            if "base_doc" in locals() and isinstance(base_doc, dict) and base_doc.get("text"):
+                cfg = ChunkingConfig(
+                    target_tokens=int(token_target),
+                    overlap_tokens=int(token_overlap),
+                    max_tokens=int(token_max),
+                )
+                fb_chunks = _fallback_chunk_text(base_doc.get("text", ""), base_meta, cfg)  # type: ignore
+                section_idxs = set()
+                token_vals = []
+                for c in fb_chunks:
+                    md = c.get("chunk_metadata") or {}
+                    if isinstance(md, dict):
+                        si = md.get("section_idx")
+                        if si is not None:
+                            section_idxs.add(si)
+                        tv = md.get("tokens_est")
+                        if isinstance(tv, int):
+                            token_vals.append(tv)
+                section_count = len(section_idxs) if section_idxs else 0
+                tokens_est_total = sum(token_vals) if token_vals else None
+                tokens_est_mean = int(round(tokens_est_total / len(token_vals))) if token_vals else None
+                return {
+                    "filepath": filepath,
+                    "status": "fallback_ok",
+                    "chunks": fb_chunks,
+                    "text_len": len(base_doc.get("text","")),  # type: ignore
+                    "chunk_count": len(fb_chunks),
+                    "detected_type": detect_doc_type({}, base_doc.get("text","")),  # type: ignore
+                    "chunk_strategy": "fallback-naive",
+                    "section_count": section_count,
+                    "tokens_est_total": tokens_est_total,
+                    "tokens_est_mean": tokens_est_mean,
+                    "parse_ms": None,
+                    "chunk_ms": None,
+                }
+        except Exception as e2:
+            return {"filepath": filepath, "status": "error", "error": f"Timeout + fallback error: {e2}"}
+        return {"filepath": filepath, "status": "error", "error": "Timeout in chunking"}
+    except Exception as e:
+        return {"filepath": filepath, "status": "error", "error": str(e)}
+
+
+def run_worker_pipelined(
+    session_name: str,
+    root_dir: Optional[str],
+    partition_file: Optional[str],
+    embedding_model: Optional[str],
+    token_target: int,
+    token_overlap: int,
+    token_max: int,
+    log_dir: str
+) -> None:
+    """
+    Pipelined worker:
+      - Stage A in ProcessPool: parse+chunk (CPU parallel)
+      - Stage B in main: GPU embed
+      - Stage C in main: DB insert
+    """
+    create_all_tables()
+
+    # Resolve file list
+    if partition_file:
+        files = read_partition_file(partition_file)
+    else:
+        if not root_dir:
+            raise ValueError("Either --partition_file or --root must be provided")
+        files = find_all_supported_files(root_dir)
+
+    embedder = Embedder(embedding_model) if embedding_model else Embedder()
+
+    processed_chunks = 0
+    successes: List[str] = []
+    failures: List[str] = []
+
+    total_files = len(files)
+    os.makedirs(log_dir, exist_ok=True)
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(DB_URL)
+        _safe_db = f"{_p.scheme}://{_p.hostname}:{_p.port}/{_p.path.lstrip('/')}"
+    except Exception:
+        _safe_db = DB_URL
+    _succ_path = os.path.join(log_dir, f"{session_name}.success.log")
+    _err_path = os.path.join(log_dir, f"{session_name}.error.log")
+    print(f"[beta_worker] {session_name}: DB = {_safe_db}", flush=True)
+    print(f"[beta_worker] {session_name}: logs: success->{_succ_path}, error->{_err_path}", flush=True)
+    print(f"[beta_worker] {session_name}: starting. files={total_files}, batch_size={int(os.environ.get('AUSLEGALSEARCH_EMBED_BATCH','64'))}, cpu_workers={CPU_WORKERS}, prefetch={PIPELINE_PREFETCH}", flush=True)
+
+    # Producer-consumer pipeline
+    with SessionLocal() as dbs:
+        _maybe_print_counts(dbs, session_name, "baseline")
+
+        file_iter = iter(files)
+        inflight = {}
+        submitted = 0
+        done_count = 0
+
+        with ProcessPoolExecutor(max_workers=CPU_WORKERS) as pool:
+            # Helper to submit up to prefetch
+            def _submit_next():
+                nonlocal submitted
+                while len(inflight) < PIPELINE_PREFETCH:
+                    try:
+                        fp = next(file_iter)
+                    except StopIteration:
+                        return
+                    # Check session-file status; skip completed
+                    esf = _db_get_esf_with_retry(dbs, session_name, fp)
+                    if esf and getattr(esf, "status", None) == "complete":
+                        done_count_local = submitted + done_count
+                        if done_count_local % 200 == 0:
+                            print(f"[beta_worker] {session_name}: SKIP already complete {done_count_local}/{total_files} -> {fp}", flush=True)
+                        continue
+                    if not esf:
+                        esf = _db_ensure_pending_esf(dbs, session_name, fp)
+                    submitted += 1
+                    print(f"[beta_worker] {session_name}: start {submitted}/{total_files} -> {fp}", flush=True)
+                    fut = pool.submit(
+                        _cpu_prepare_file,
+                        fp, root_dir, int(token_target), int(token_overlap), int(token_max)
+                    )
+                    inflight[fut] = fp
+
+            _submit_next()
+
+            while inflight:
+                # take first completed
+                for fut in as_completed(list(inflight.keys()), timeout=None):
+                    fp = inflight.pop(fut)
+                    done_count += 1
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        # Child crashed
+                        try:
+                            esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=fp).first()
+                            if esf:
+                                esf.status = "error"
+                                dbs.commit()
+                        except Exception:
+                            pass
+                        failures.append(fp)
+                        _append_log_line(log_dir, session_name, fp, success=False)
+                        print(f"[beta_worker] {session_name}: FAILED (prep) {done_count}/{total_files} -> {fp} :: {e}", flush=True)
+                        _append_error_detail(
+                            log_dir, session_name, fp,
+                            "prep", type(e).__name__, str(e),
+                            None, None, None
+                        )
+                        break  # process next completion
+
+                    status = res.get("status")
+                    if status in ("empty", "zero_chunks"):
+                        # mark complete with 0 chunks
+                        try:
+                            esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=fp).first()
+                            if esf:
+                                esf.status = "complete"
+                                dbs.commit()
+                        except Exception:
+                            pass
+                        successes.append(fp)
+                        _append_success_metrics_line(
+                            log_dir=log_dir,
+                            session_name=session_name,
+                            file_path=fp,
+                            chunks_count=0,
+                            text_len=res.get("text_len") or 0,
+                            cfg=ChunkingConfig(target_tokens=int(token_target), overlap_tokens=int(token_overlap), max_tokens=int(token_max)),
+                            strategy=res.get("chunk_strategy") or "no-chunks",
+                            detected_type=res.get("detected_type"),
+                            section_count=0,
+                            tokens_est_total=0,
+                            tokens_est_mean=0,
+                            parse_ms=res.get("parse_ms"),
+                            chunk_ms=res.get("chunk_ms"),
+                            embed_ms=None,
+                            insert_ms=None,
+                        )
+                        print(f"[beta_worker] {session_name}: OK (0 chunks) {done_count}/{total_files} -> {fp}", flush=True)
+                        break
+
+                    if status == "error":
+                        try:
+                            esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=fp).first()
+                            if esf:
+                                esf.status = "error"
+                                dbs.commit()
+                        except Exception:
+                            pass
+                        failures.append(fp)
+                        _append_log_line(log_dir, session_name, fp, success=False)
+                        print(f"[beta_worker] {session_name}: FAILED (prep) {done_count}/{total_files} -> {fp} :: {res.get('error')}", flush=True)
+                        _append_error_detail(
+                            log_dir, session_name, fp,
+                            "prep", "Error", str(res.get("error") or ""),
+                            None, None, None
+                        )
+                        break
+
+                    # Embed + Insert (main process)
+                    file_chunks = res.get("chunks") or []
+                    current_chunk_count = int(res.get("chunk_count") or len(file_chunks))
+                    current_text_len = int(res.get("text_len") or 0)
+                    chunk_strategy = res.get("chunk_strategy") or "semantic"
+                    detected_type = res.get("detected_type")
+
+                    texts = [c["text"] for c in file_chunks]
+                    print(f"[beta_worker] {session_name}: parse done {res.get('parse_ms')}ms len={current_text_len}", flush=True)
+                    print(f"[beta_worker] {session_name}: chunk done {res.get('chunk_ms')}ms chunks={current_chunk_count}", flush=True)
+
+                    # embed
+                    print(f"[beta_worker] {session_name}: embed start batch={int(os.environ.get('AUSLEGALSEARCH_EMBED_BATCH','64'))} texts={len(texts)}", flush=True)
+                    tE = time.time()
+                    vecs = _embed_in_batches(embedder, texts, batch_size=int(os.environ.get("AUSLEGALSEARCH_EMBED_BATCH","64")))
+                    embed_ms = int((time.time() - tE) * 1000)
+                    print(f"[beta_worker] {session_name}: embed done {embed_ms}ms", flush=True)
+
+                    # insert
+                    print(f"[beta_worker] {session_name}: insert start", flush=True)
+                    tI = time.time()
+                    fmt = "txt"
+                    inserted = _db_insert_with_retry(
+                        session=dbs,
+                        chunks= file_chunks,
+                        vectors=vecs,
+                        source_path=fp,
+                        fmt=fmt,
+                    )
+                    insert_ms = int((time.time() - tI) * 1000)
+                    print(f"[beta_worker] {session_name}: insert done {insert_ms}ms rows={inserted}", flush=True)
+                    processed_chunks += inserted
+
+                    # mark complete + progress
+                    try:
+                        esf = dbs.query(EmbeddingSessionFile).filter_by(session_name=session_name, filepath=fp).first()
+                        if esf:
+                            esf.status = "complete"
+                            dbs.commit()
+                    except Exception:
+                        pass
+                    try:
+                        with _deadline(SELECT_TIMEOUT):
+                            update_session_progress(session_name, last_file=fp, last_chunk=inserted - 1, processed_chunks=processed_chunks)
+                    except _Timeout:
+                        print(f"[beta_worker] {session_name}: progress update timeout for {fp}", flush=True)
+
+                    successes.append(fp)
+                    _append_success_metrics_line(
+                        log_dir=log_dir,
+                        session_name=session_name,
+                        file_path=fp,
+                        chunks_count=current_chunk_count or 0,
+                        text_len=current_text_len or 0,
+                        cfg=ChunkingConfig(target_tokens=int(token_target), overlap_tokens=int(token_overlap), max_tokens=int(token_max)),
+                        strategy=chunk_strategy,
+                        detected_type=detected_type,
+                        section_count=res.get("section_count"),
+                        tokens_est_total=res.get("tokens_est_total"),
+                        tokens_est_mean=res.get("tokens_est_mean"),
+                        parse_ms=res.get("parse_ms"),
+                        chunk_ms=res.get("chunk_ms"),
+                        embed_ms=embed_ms,
+                        insert_ms=insert_ms,
+                    )
+
+                    if done_count % 10 == 0 or inserted > 0:
+                        print(f"[beta_worker] {session_name}: OK {done_count}/{total_files}, chunks+={inserted}, total_chunks={processed_chunks}", flush=True)
+                    if os.environ.get("AUSLEGALSEARCH_DEBUG_COUNTS", "0") == "1" and done_count % 50 == 0:
+                        _maybe_print_counts(dbs, session_name, f"after {done_count} files")
+                    break  # process next completion
+
+                _submit_next()
+
+    # Write logs
+    paths = _write_logs(log_dir, session_name, successes, failures)
+    print(f"[beta_worker] Session {session_name} complete. Files OK: {len(successes)}, failed: {len(failures)}", flush=True)
+    print(f"[beta_worker] Success log: {paths['success_log']}", flush=True)
+    print(f"[beta_worker] Error log:   {paths['error_log']}", flush=True)
+    complete_session(session_name)
+
+
 def run_worker(
     session_name: str,
     root_dir: Optional[str],
@@ -528,6 +945,10 @@ def run_worker(
     """
     Main loop for this worker.
     """
+    # Use pipelined mode when multiple CPU workers are configured
+    if CPU_WORKERS > 1 or int(os.environ.get("AUSLEGALSEARCH_PIPELINE_PREFETCH", str(PIPELINE_PREFETCH))) > 0:
+        return run_worker_pipelined(session_name, root_dir, partition_file, embedding_model, token_target, token_overlap, token_max, log_dir)
+
     create_all_tables()  # Ensure extensions, indexes, triggers
 
     # Resolve file list
