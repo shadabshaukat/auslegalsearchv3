@@ -29,7 +29,13 @@ ALTER TABLE public.embeddings
   ADD COLUMN IF NOT EXISTS md_jurisdiction     text GENERATED ALWAYS AS ((chunk_metadata->>'jurisdiction')) STORED,
   ADD COLUMN IF NOT EXISTS md_subjurisdiction  text GENERATED ALWAYS AS ((chunk_metadata->>'subjurisdiction')) STORED,
   ADD COLUMN IF NOT EXISTS md_database         text GENERATED ALWAYS AS ((chunk_metadata->>'database')) STORED,
-  ADD COLUMN IF NOT EXISTS md_date             date GENERATED ALWAYS AS (((chunk_metadata->>'date')::date)) STORED,
+  ADD COLUMN IF NOT EXISTS md_date             date GENERATED ALWAYS AS (
+    make_date(
+      substr((chunk_metadata->>'date'), 1, 4)::int,
+      substr((chunk_metadata->>'date'), 6, 2)::int,
+      substr((chunk_metadata->>'date'), 9, 2)::int
+    )
+  ) STORED,
   ADD COLUMN IF NOT EXISTS md_year             int  GENERATED ALWAYS AS (((chunk_metadata->>'year')::int)) STORED,
   ADD COLUMN IF NOT EXISTS md_title            text GENERATED ALWAYS AS ((chunk_metadata->>'title')) STORED,
   ADD COLUMN IF NOT EXISTS md_title_lc         text GENERATED ALWAYS AS (lower(coalesce(chunk_metadata->>'title',''))) STORED,

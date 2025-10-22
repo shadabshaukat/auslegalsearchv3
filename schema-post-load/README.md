@@ -147,3 +147,44 @@ Contact points for further tuning
 - Provide EXPLAIN (ANALYZE, BUFFERS) for slow queries and the output of:
   SELECT extversion FROM pg_extension WHERE extname='vector';
 - We can adjust partial indexes, lists/ef_search, or query shapes further based on real plans.
+
+Operational updates and notes
+
+Troubleshooting “generation expression is not immutable” (md_date)
+- Some date expressions are not considered immutable by PostgreSQL when used in GENERATED ALWAYS AS STORED columns (e.g., (text)::date).
+- This repo uses an immutable expression for md_date:
+  make_date(
+    substr((chunk_metadata->>'date'), 1, 4)::int,
+    substr((chunk_metadata->>'date'), 6, 2)::int,
+    substr((chunk_metadata->>'date'), 9, 2)::int
+  )
+- If you previously saw “generation expression is not immutable,” re-apply schema-post-load/create_indexes.sql with this expression.
+
+Do I need extra data load if rows are added/removed?
+- No. Generated STORED columns are computed from the row’s JSONB automatically on INSERT/UPDATE; DELETE removes the row.
+- Indexes (btree/GIN/trigram) and vector indexes (HNSW/IVFFLAT) are maintained automatically by PostgreSQL on DML.
+- The only time a table rewrite happens is when you add/alter a GENERATED STORED column (one-time rewrite to materialize). Routine DML does not require any manual sync.
+
+Post-batch maintenance (TB-scale)
+- After large ingests/deletes/updates: ANALYZE public.embeddings; ANALYZE public.documents;
+- If heavy deletes caused table bloat, VACUUM (or pg_repack for online compaction).
+- Consider autovacuum tuning (scale_factor/threshold/naptime) to keep up with churn at very large sizes.
+
+Bench script coverage and session tuning
+- tools/bench_sql_latency.py includes:
+  - Vector + JSON filters latency
+  - FTS latency
+  - Metadata-only filters latency
+  - Multi-run p50/p95 summary, hybrid combine
+- Supported filters include:
+  type, jurisdiction, subjurisdiction, database, year, date_from/date_to,
+  title_eq, author_eq, citation (single),
+  title_member (titles[]), citation_member (citations[]), country (countries[]),
+  source_approx (trigram on documents.source), author/title trigram
+- Per-run tuning:
+  --probes (IVFFLAT), --hnsw_ef (HNSW), --use_jit (JIT off by default recommended for tail latency)
+
+About editor/linter errors
+- Some DB tools do not parse PostgreSQL JSONB operators (->, ->>) or GENERATED columns and may show false errors.
+- These scripts are valid for PostgreSQL 12+. Execute via psql or a Postgres-aware admin tool.
+- If your tool blocks STORED columns, use the expression-index-only script and schedule the generated-columns variant later.
