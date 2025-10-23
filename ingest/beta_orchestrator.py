@@ -56,7 +56,8 @@ from ingest.beta_scanner import find_sample_files         # sample/preview mode 
 
 # DB session tracking (use same schema/functions as existing pipeline)
 from db.store import start_session, create_all_tables
-from db.connector import DB_URL
+from db.connector import DB_URL, engine
+from sqlalchemy import text
 
 
 def _natural_sort_key(s: str):
@@ -130,6 +131,7 @@ def launch_worker(
     if gpu_index is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
+    print(f"[beta_orchestrator] launching: {' '.join(cmd)} (GPU={env.get('CUDA_VISIBLE_DEVICES','N/A')})", flush=True)
     proc = subprocess.Popen(cmd, env=env)
     return proc
 
@@ -146,6 +148,17 @@ def _write_lines(path: Path, lines: List[str]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for ln in lines:
             f.write(ln + "\n")
+
+
+def _db_ping() -> bool:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("[beta_orchestrator] DB ping OK", flush=True)
+        return True
+    except Exception as e:
+        print(f"[beta_orchestrator] DB ping FAILED: {e}", flush=True)
+        return False
 
 
 def orchestrate(
@@ -171,7 +184,16 @@ def orchestrate(
     - Optionally wait for completion and return status
     - If waiting, aggregate worker logs into master success/error logs for the base session
     """
+    print(f"[beta_orchestrator] start session={session_name}", flush=True)
+    print(f"[beta_orchestrator] root={root_dir}, model={embedding_model}, log_dir={log_dir}", flush=True)
+    print(f"[beta_orchestrator] cwd={os.getcwd()}", flush=True)
+    # Quick DB connectivity check before heavy work
+    if not _db_ping():
+        print("[beta_orchestrator] Aborting: cannot connect to DB. Check .env and network.", flush=True)
+        raise RuntimeError("DB ping failed")
+    print("[beta_orchestrator] Ensuring schema...", flush=True)
     create_all_tables()  # Ensure schema + FTS triggers
+    print("[beta_orchestrator] Schema OK", flush=True)
     log_root = Path(log_dir).resolve()
     log_root.mkdir(parents=True, exist_ok=True)
     try:
@@ -187,12 +209,14 @@ def orchestrate(
     start_iso = datetime.utcnow().isoformat() + "Z"
 
     # Resolve file list
+    print(f"[beta_orchestrator] Resolving files (sample_mode={bool(sample_per_folder)})...", flush=True)
     if sample_per_folder:
         files = find_sample_files(root_dir, skip_year_dirs=skip_year_dirs_in_sample)
     else:
         files = find_all_supported_files(root_dir)
     files = sorted(list(dict.fromkeys(files)), key=_natural_sort_key)
     total_files = len(files)
+    print(f"[beta_orchestrator] Found files={total_files}", flush=True)
 
     if total_files == 0:
         raise RuntimeError(f"No supported files found under root: {root_dir}")
