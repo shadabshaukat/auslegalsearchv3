@@ -107,18 +107,30 @@ def create_all_tables():
 
     Base.metadata.create_all(engine)
     # --- Post-table DDL: create indexes, triggers, and FTS structures if missing ---
+    # Light-init mode skips heavy backfills and large index builds to avoid stalls on new instances.
+    # Set AUSLEGALSEARCH_SCHEMA_LIGHT_INIT=1 in the environment to enable.
+    LIGHT_INIT = os.environ.get("AUSLEGALSEARCH_SCHEMA_LIGHT_INIT", "0") == "1"
+
     ddl_sql = [
         # 1. Add document_fts if missing
         """
         ALTER TABLE public.documents
         ADD COLUMN IF NOT EXISTS document_fts tsvector
         """,
-        # 2. Populate document_fts
-        """
-        UPDATE public.documents
-        SET document_fts = to_tsvector('english', coalesce(content, ''))
-        WHERE document_fts IS NULL
-        """,
+    ]
+
+    # 2. Populate document_fts (heavy backfill) — skip in LIGHT_INIT
+    if not LIGHT_INIT:
+        ddl_sql.append(
+            """
+            UPDATE public.documents
+            SET document_fts = to_tsvector('english', coalesce(content, ''))
+            WHERE document_fts IS NULL
+            """
+        )
+
+    # 3-6. Indexes and trigger for FTS maintenance
+    ddl_sql.extend([
         # 3. GIN FTS index for document_fts
         """
         CREATE INDEX IF NOT EXISTS idx_documents_fts
@@ -147,13 +159,20 @@ def create_all_tables():
         BEFORE INSERT OR UPDATE ON public.documents
         FOR EACH ROW EXECUTE FUNCTION documents_fts_trigger()
         """,
-        # 7. IVFFLAT vector index for cosine on embeddings
-        """
-        CREATE INDEX IF NOT EXISTS idx_embeddings_vector_ivfflat_cosine
-        ON public.embeddings USING ivfflat (vector vector_cosine_ops)
-        WITH (lists = 100)
-        """,
-        # Ensure we never create duplicate session-file rows on retries/resumes
+    ])
+
+    # 7. IVFFLAT vector index for cosine on embeddings — skip build in LIGHT_INIT
+    if not LIGHT_INIT:
+        ddl_sql.append(
+            """
+            CREATE INDEX IF NOT EXISTS idx_embeddings_vector_ivfflat_cosine
+            ON public.embeddings USING ivfflat (vector vector_cosine_ops)
+            WITH (lists = 100)
+            """
+        )
+
+    # Ensure we never create duplicate session-file rows on retries/resumes
+    ddl_sql.extend([
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_esf_session_file
         ON public.embedding_session_files (session_name, filepath)
@@ -162,7 +181,7 @@ def create_all_tables():
         CREATE INDEX IF NOT EXISTS idx_esf_status
         ON public.embedding_session_files (status)
         """,
-    ]
+    ])
     # Force psql to continue on error for objects already existing
     with engine.begin() as conn:
         for ddl in ddl_sql:
@@ -547,8 +566,6 @@ def search_fts(query, top_k=10, mode="both"):
         # Optionally, rank: for now keep order, but slice to top_k
         return unique_hits[:top_k]
 
-if os.environ.get("AUSLEGALSEARCH_AUTO_DDL", "1") == "1":
-    create_all_tables()
 
 __all__ = [
     "Base", "engine", "SessionLocal", "Vector", "JSONB", "UUIDType",
