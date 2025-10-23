@@ -92,6 +92,34 @@ def partition(items: List[str], n: int) -> List[List[str]]:
     return [p for p in parts if p]
 
 
+def partition_by_size(items: List[str], n: int) -> List[List[str]]:
+    """
+    Greedy bin-packing by total file size (descending) across n bins.
+    Provides better runtime balance than equal file counts when file sizes vary widely.
+    """
+    if n <= 1:
+        return [items]
+    try:
+        def _sz(p: str) -> int:
+            try:
+                return int(os.path.getsize(p))
+            except Exception:
+                return 0
+        sized = sorted(items, key=_sz, reverse=True)
+        bins: List[List[str]] = [[] for _ in range(n)]
+        bin_sizes = [0] * n
+        for path in sized:
+            # place into bin with smallest current size
+            j = min(range(n), key=lambda i: bin_sizes[i])
+            bins[j].append(path)
+            bin_sizes[j] += _sz(path)
+        # drop any empty bins (if more bins than files)
+        return [b for b in bins if b]
+    except Exception:
+        # fallback to simple partition on any unexpected error
+        return partition(items, n)
+
+
 def write_partition_file(part: List[str], fname: str) -> None:
     with open(fname, "w") as f:
         for p in part:
@@ -172,6 +200,7 @@ def orchestrate(
     overlap_tokens: int,
     max_tokens: int,
     log_dir: str,
+    balance_by_size: bool = False,
     wait: bool = True
 ) -> Dict[str, Any]:
     """
@@ -229,7 +258,11 @@ def orchestrate(
         num = max(1, min(num_gpus, detected))
     print(f"[beta_orchestrator] GPUs detected={detected}, using={num}, parent CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}", flush=True)
 
-    parts = partition(files, num)
+    if balance_by_size:
+        print(f"[beta_orchestrator] Partitioning by total file size across {num} GPU(s)...", flush=True)
+        parts = partition_by_size(files, num)
+    else:
+        parts = partition(files, num)
     if not parts:
         parts = [files]
 
@@ -365,6 +398,7 @@ def _parse_cli_args(argv: List[str]) -> Dict[str, Any]:
     ap.add_argument("--max_tokens", type=int, default=640, help="Hard max per chunk (default 640)")
     ap.add_argument("--log_dir", default="./logs", help="Directory to write per-worker and aggregated success/error logs")
     ap.add_argument("--no_wait", action="store_true", help="Do not wait for workers; exit after launch (no aggregation)")
+    ap.add_argument("--balance_by_size", action="store_true", help="Greedy size-balanced partitions across GPUs (better load balance)")
     return vars(ap.parse_args(argv))
 
 
@@ -381,6 +415,7 @@ if __name__ == "__main__":
         overlap_tokens=args.get("overlap_tokens") or 64,
         max_tokens=args.get("max_tokens") or 640,
         log_dir=args.get("log_dir") or "./logs",
+        balance_by_size=bool(args.get("balance_by_size")),
         wait=not bool(args.get("no_wait")),
     )
     print(json.dumps(summary, indent=2))
