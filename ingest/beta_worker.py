@@ -45,7 +45,7 @@ from db.store import (
     start_session, update_session_progress, complete_session, fail_session,
     EmbeddingSessionFile, SessionLocal, Document, Embedding
 )
-from db.connector import DB_URL
+from db.connector import DB_URL, engine
 
 # Timeouts (seconds). Tunable via env.
 PARSE_TIMEOUT = int(os.environ.get("AUSLEGALSEARCH_TIMEOUT_PARSE", "60"))
@@ -708,7 +708,24 @@ def run_worker_pipelined(
       - Stage B in main: GPU embed
       - Stage C in main: DB insert
     """
+    # Early diagnostics to surface stalls on new instances
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(DB_URL)
+        _safe_db = f"{_p.scheme}://{_p.hostname}:{_p.port}/{_p.path.lstrip('/')}"
+    except Exception:
+        _safe_db = DB_URL
+    print(f"[beta_worker] start session={session_name} cwd={os.getcwd()} DB={_safe_db}", flush=True)
+    try:
+        with engine.connect() as _conn:
+            _conn.execute(text("SELECT 1"))
+        print("[beta_worker] DB ping OK", flush=True)
+    except Exception as _e:
+        print(f"[beta_worker] DB ping FAILED: {_e}", flush=True)
+        raise
+    print("[beta_worker] Ensuring schema...", flush=True)
     create_all_tables()
+    print("[beta_worker] Schema OK", flush=True)
 
     # Resolve file list
     if partition_file:
@@ -949,7 +966,24 @@ def run_worker(
     if CPU_WORKERS > 1 or int(os.environ.get("AUSLEGALSEARCH_PIPELINE_PREFETCH", str(PIPELINE_PREFETCH))) > 0:
         return run_worker_pipelined(session_name, root_dir, partition_file, embedding_model, token_target, token_overlap, token_max, log_dir)
 
+    # Early diagnostics
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(DB_URL)
+        _safe_db = f"{_p.scheme}://{_p.hostname}:{_p.port}/{_p.path.lstrip('/')}"
+    except Exception:
+        _safe_db = DB_URL
+    print(f"[beta_worker] start (single) session={session_name} cwd={os.getcwd()} DB={_safe_db}", flush=True)
+    try:
+        with engine.connect() as _conn:
+            _conn.execute(text("SELECT 1"))
+        print("[beta_worker] DB ping OK", flush=True)
+    except Exception as _e:
+        print(f"[beta_worker] DB ping FAILED: {_e}", flush=True)
+        raise
+    print("[beta_worker] Ensuring schema...", flush=True)
     create_all_tables()  # Ensure extensions, indexes, triggers
+    print("[beta_worker] Schema OK", flush=True)
 
     # Resolve file list
     if partition_file:
