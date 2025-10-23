@@ -30,13 +30,31 @@ ALTER TABLE public.embeddings
   ADD COLUMN IF NOT EXISTS md_subjurisdiction  text GENERATED ALWAYS AS ((chunk_metadata->>'subjurisdiction')) STORED,
   ADD COLUMN IF NOT EXISTS md_database         text GENERATED ALWAYS AS ((chunk_metadata->>'database')) STORED,
   ADD COLUMN IF NOT EXISTS md_date             date GENERATED ALWAYS AS (
-    make_date(
-      substr((chunk_metadata->>'date'), 1, 4)::int,
-      substr((chunk_metadata->>'date'), 6, 2)::int,
-      substr((chunk_metadata->>'date'), 9, 2)::int
-    )
+    CASE
+      WHEN
+        length(split_part((chunk_metadata->>'date'), ' ', 1)) >= 10
+        AND substr(split_part((chunk_metadata->>'date'), ' ', 1), 5, 1) = '-'
+        AND substr(split_part((chunk_metadata->>'date'), ' ', 1), 8, 1) = '-'
+        AND translate(substr(split_part((chunk_metadata->>'date'), ' ', 1), 1, 4), '0123456789', '') = ''
+        AND translate(substr(split_part((chunk_metadata->>'date'), ' ', 1), 6, 2), '0123456789', '') = ''
+        AND translate(substr(split_part((chunk_metadata->>'date'), ' ', 1), 9, 2), '0123456789', '') = ''
+      THEN make_date(
+        substr(split_part((chunk_metadata->>'date'), ' ', 1), 1, 4)::int,
+        substr(split_part((chunk_metadata->>'date'), ' ', 1), 6, 2)::int,
+        substr(split_part((chunk_metadata->>'date'), ' ', 1), 9, 2)::int
+      )
+      ELSE NULL
+    END
   ) STORED,
-  ADD COLUMN IF NOT EXISTS md_year             int  GENERATED ALWAYS AS (((chunk_metadata->>'year')::int)) STORED,
+  ADD COLUMN IF NOT EXISTS md_year             int  GENERATED ALWAYS AS (
+    CASE
+      WHEN (chunk_metadata ? 'year')
+           AND translate(coalesce((chunk_metadata->>'year'), ''), '0123456789', '') = ''
+           AND length(coalesce((chunk_metadata->>'year'), '')) BETWEEN 1 AND 6
+      THEN (chunk_metadata->>'year')::int
+      ELSE NULL
+    END
+  ) STORED,
   ADD COLUMN IF NOT EXISTS md_title            text GENERATED ALWAYS AS ((chunk_metadata->>'title')) STORED,
   ADD COLUMN IF NOT EXISTS md_title_lc         text GENERATED ALWAYS AS (lower(coalesce(chunk_metadata->>'title',''))) STORED,
   ADD COLUMN IF NOT EXISTS md_author           text GENERATED ALWAYS AS ((chunk_metadata->>'author')) STORED,

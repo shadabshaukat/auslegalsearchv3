@@ -26,10 +26,33 @@ CREATE INDEX IF NOT EXISTS idx_e_md_database_expr
   ON public.embeddings ((chunk_metadata->>'database'));
 
 CREATE INDEX IF NOT EXISTS idx_e_md_date_expr
-  ON public.embeddings (((chunk_metadata->>'date')::date));
+  ON public.embeddings (
+    CASE
+      WHEN
+        length(split_part((chunk_metadata->>'date'), ' ', 1)) >= 10
+        AND substr(split_part((chunk_metadata->>'date'), ' ', 1), 5, 1) = '-'
+        AND substr(split_part((chunk_metadata->>'date'), ' ', 1), 8, 1) = '-'
+        AND translate(substr(split_part((chunk_metadata->>'date'), ' ', 1), 1, 4), '0123456789', '') = ''
+        AND translate(substr(split_part((chunk_metadata->>'date'), ' ', 1), 6, 2), '0123456789', '') = ''
+        AND translate(substr(split_part((chunk_metadata->>'date'), ' ', 1), 9, 2), '0123456789', '') = ''
+      THEN make_date(
+        substr(split_part((chunk_metadata->>'date'), ' ', 1), 1, 4)::int,
+        substr(split_part((chunk_metadata->>'date'), ' ', 1), 6, 2)::int,
+        substr(split_part((chunk_metadata->>'date'), ' ', 1), 9, 2)::int
+      )
+      ELSE NULL
+    END
+  );
 
 CREATE INDEX IF NOT EXISTS idx_e_md_year_expr
-  ON public.embeddings (((chunk_metadata->>'year')::int));
+  ON public.embeddings (
+    CASE
+      WHEN translate(coalesce((chunk_metadata->>'year'), ''), '0123456789', '') = ''
+           AND length(coalesce((chunk_metadata->>'year'), '')) BETWEEN 1 AND 6
+      THEN (chunk_metadata->>'year')::int
+      ELSE NULL
+    END
+  );
 
 -- Optional: exact equality on title/author/citation
 CREATE INDEX IF NOT EXISTS idx_e_md_title_expr
