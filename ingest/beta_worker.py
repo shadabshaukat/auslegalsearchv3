@@ -35,6 +35,7 @@ import json
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import deque
+import multiprocessing as mp
 
 from ingest.loader import parse_txt, parse_html
 from ingest.semantic_chunker import chunk_document_semantic, ChunkingConfig, detect_doc_type, chunk_legislation_dashed_semantic, chunk_generic_rcts
@@ -692,6 +693,14 @@ def _cpu_prepare_file(
         return {"filepath": filepath, "status": "error", "error": str(e)}
 
 
+# Avoid CUDA-for-fork deadlocks: prefer 'spawn' so worker pool processes do NOT inherit CUDA context
+try:
+    mp.set_start_method("spawn", force=False)
+except RuntimeError:
+    # Already set elsewhere; ignore
+    pass
+
+
 def run_worker_pipelined(
     session_name: str,
     root_dir: Optional[str],
@@ -735,7 +744,8 @@ def run_worker_pipelined(
             raise ValueError("Either --partition_file or --root must be provided")
         files = find_all_supported_files(root_dir)
 
-    embedder = Embedder(embedding_model) if embedding_model else Embedder()
+    # Defer CUDA model initialization until AFTER the worker pool is created to avoid CUDA context fork
+    embedder = None  # type: ignore
 
     processed_chunks = 0
     successes: List[str] = []
@@ -765,6 +775,10 @@ def run_worker_pipelined(
         done_count = 0
 
         with ProcessPoolExecutor(max_workers=CPU_WORKERS) as pool:
+            # Initialize embedder AFTER pool is created so forked processes don't inherit CUDA context
+            nonlocal_embedder = Embedder(embedding_model) if embedding_model else Embedder()
+            embedder = nonlocal_embedder  # type: ignore
+
             # Helper to submit up to prefetch
             def _submit_next():
                 nonlocal submitted
