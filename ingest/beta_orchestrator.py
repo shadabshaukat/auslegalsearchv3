@@ -227,6 +227,7 @@ def orchestrate(
         num = detected
     else:
         num = max(1, min(num_gpus, detected))
+    print(f"[beta_orchestrator] GPUs detected={detected}, using={num}, parent CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}", flush=True)
 
     parts = partition(files, num)
     if not parts:
@@ -324,6 +325,17 @@ def orchestrate(
         f.write("# --- aggregated child error entries ---\n")
         for ln in all_error:
             f.write(ln + "\n")
+
+    # Append master summary into each child's success log (for convenience)
+    try:
+        for child in child_sessions:
+            c_succ = log_root / f"{child}.success.log"
+            with c_succ.open("a", encoding="utf-8") as f:
+                f.write(f"# master_summary session={session_name} files_ok={len(all_success)} files_failed={len(all_error)}\n")
+                f.write(f"# master_success_log={master_success}\n")
+                f.write(f"# master_error_log={master_error}\n")
+    except Exception as e:
+        print(f"[beta_orchestrator] Note: failed to append master summary to child success logs: {e}", flush=True)
 
     print(f"[beta_orchestrator] Aggregated logs for session {session_name}")
     print(f"[beta_orchestrator] Success log: {master_success} (files: {len(all_success)})")
