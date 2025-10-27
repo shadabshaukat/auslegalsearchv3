@@ -584,7 +584,12 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
       e.md_jurisdiction AS jurisdiction,
       e.md_date AS case_date,
       e.md_database AS court,
-      COALESCE(e.md_citation, (SELECT min(x) FROM jsonb_array_elements_text(e.md_citations) AS x)) AS citation,
+      MIN(
+        COALESCE(
+          e.md_citation,
+          (SELECT min(x) FROM jsonb_array_elements_text(COALESCE(e.md_citations,'[]'::jsonb)) AS x(x))
+        )
+      ) AS citation,
       (
         SELECT string_agg(DISTINCT t, '; ')
         FROM (
@@ -604,7 +609,7 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
           WHERE lower(c.val) = ANY(:citations)
         )
       )
-    GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database, e.md_citation
+    GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database
     ORDER BY e.md_date DESC
     """
     rows = conn.execute(text(sql), {"citations": citations}).fetchall()
@@ -756,11 +761,11 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
       e.md_title AS title,
       e.md_author AS author,
       e.md_date AS date,
-      similarity(e.md_title_lc, LOWER(:q::text)) AS score
+      similarity(e.md_title_lc, LOWER(:q)) AS score
     FROM embeddings e
     JOIN documents d ON d.id = e.doc_id
     WHERE e.md_type = ANY(:types)
-      AND (e.md_title_lc % LOWER(:q::text))
+      AND (e.md_title_lc % LOWER(:q))
     GROUP BY d.id, d.source, e.md_type, e.md_title, e.md_author, e.md_date
     ORDER BY score DESC, e.md_date DESC
     LIMIT :lim
@@ -924,10 +929,10 @@ def run_source_approx(conn: Connection, source: str, limit: int, trgm_limit: Opt
     t0 = _now_ms()
     _set_trgm_limit(conn, trgm_limit)
     sql = """
-    SELECT id AS doc_id, source AS url, similarity(lower(source), LOWER(:q::text)) AS score
+    SELECT id AS doc_id, source AS url, similarity(lower(source), LOWER(:q)) AS score
     FROM documents
-    WHERE lower(source) % LOWER(:q::text)
-    ORDER BY similarity(lower(source), LOWER(:q::text)) DESC
+    WHERE lower(source) % LOWER(:q)
+    ORDER BY similarity(lower(source), LOWER(:q)) DESC
     LIMIT :lim::int
     """
     rows = conn.execute(text(sql), {"q": source, "lim": int(limit)}).fetchall()
