@@ -345,11 +345,11 @@ def search_vector(query_vec, top_k=5):
         param_dict['topk'] = top_k
         array_sql = "ARRAY[" + ",".join(array_params) + "]::vector"
         sql = f'''
-        SELECT embeddings.doc_id, embeddings.chunk_index, embeddings.vector <#> {array_sql} AS score,
+        SELECT embeddings.doc_id, embeddings.chunk_index, embeddings.vector <=> {array_sql} AS score,
             documents.content, documents.source, documents.format, embeddings.chunk_metadata
         FROM embeddings
         JOIN documents ON embeddings.doc_id = documents.id
-        ORDER BY embeddings.vector <#> {array_sql} ASC
+        ORDER BY embeddings.vector <=> {array_sql} ASC
         LIMIT :topk
         '''
         result = session.execute(text(sql), param_dict)

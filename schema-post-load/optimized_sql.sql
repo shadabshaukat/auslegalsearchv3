@@ -162,7 +162,7 @@ ann AS (
   SELECT
     e.doc_id,
     e.chunk_index,
-    e.vector <#> $1::vector AS distance,
+    e.vector <=> $1::vector AS distance,
     e.md_type, e.md_database, e.md_jurisdiction, e.md_date, e.md_year,
     e.md_title, e.md_author, e.md_countries
   FROM embeddings e, params p
@@ -178,7 +178,7 @@ ann AS (
         WHERE LOWER(c.val) = LOWER(p.country)
       )
     )
-  ORDER BY e.vector <#> $1::vector
+  ORDER BY e.vector <=> $1::vector
   LIMIT (SELECT top_k FROM params)
 )
 SELECT

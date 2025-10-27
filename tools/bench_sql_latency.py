@@ -111,6 +111,125 @@ def _set_trgm_limit(conn: Connection, trgm_limit: Optional[float]) -> None:
         limit = max(0.0, min(1.0, float(trgm_limit)))
         conn.execute(text("SELECT set_limit(:l)"), {"l": limit})
 
+def _set_misc(conn: Connection, disable_seqscan: bool = False, effective_io: Optional[int] = None) -> None:
+    """
+    Optional session-level diagnostics/tuning:
+      - disable_seqscan: SET LOCAL enable_seqscan = off (forces index usage if possible; diagnostic only)
+      - effective_io: SET LOCAL effective_io_concurrency = N (improves I/O prefetch on fast storage)
+    """
+    if disable_seqscan:
+        conn.execute(text("SET LOCAL enable_seqscan = off"))
+    if effective_io and int(effective_io) > 0:
+        conn.execute(text("SET LOCAL effective_io_concurrency = :n"), {"n": int(effective_io)})
+
+def _explain_vector_query(
+    conn: Connection,
+    query_vec: List[float],
+    top_k: int,
+    filters: Dict[str, Any],
+    probes: Optional[int] = None,
+    hnsw_ef: Optional[int] = None,
+    use_jit: bool = False,
+) -> None:
+    """
+    Print EXPLAIN ANALYZE for the vector query (baseline path) with current filters.
+    Helps validate index usage (partial IVFFLAT/HNSW), estimates, and latency.
+    """
+    _set_session_tuning(conn, use_jit=use_jit)
+    _set_ivf_probes(conn, probes)
+    _set_hnsw_ef(conn, hnsw_ef)
+    array_sql, arr_params = _build_vector_array_sql(query_vec)
+
+    where_clauses = []
+    params: Dict[str, Any] = {"topk": int(top_k)}
+    # Match the same filter shape as run_vector_query
+    if filters.get("type"):
+        where_clauses.append("(e.md_type = :type_exact OR (e.chunk_metadata->>'type') = :type_exact)")
+        params["type_exact"] = str(filters["type"])
+    if filters.get("jurisdiction"):
+        where_clauses.append("(e.md_jurisdiction = :jurisdiction_exact OR (e.chunk_metadata->>'jurisdiction') = :jurisdiction_exact)")
+        params["jurisdiction_exact"] = str(filters["jurisdiction"])
+    if filters.get("subjurisdiction"):
+        where_clauses.append("(e.md_subjurisdiction = :subjurisdiction_exact OR (e.chunk_metadata->>'subjurisdiction') = :subjurisdiction_exact)")
+        params["subjurisdiction_exact"] = str(filters["subjurisdiction"])
+    if filters.get("database"):
+        where_clauses.append("(e.md_database = :database_exact OR (e.chunk_metadata->>'database') = :database_exact)")
+        params["database_exact"] = str(filters["database"])
+    if filters.get("year") is not None:
+        where_clauses.append("(e.md_year = :year_exact OR ((e.chunk_metadata->>'year')::int) = :year_exact)")
+        params["year_exact"] = int(filters["year"])
+    if filters.get("date_from") and filters.get("date_to"):
+        where_clauses.append("((e.md_date BETWEEN :df AND :dt) OR ((e.chunk_metadata->>'date')::date BETWEEN :df AND :dt))")
+        params["df"] = str(filters["date_from"])
+        params["dt"] = str(filters["date_to"])
+    if filters.get("title_eq"):
+        where_clauses.append("(e.md_title = :title_eq OR (e.chunk_metadata->>'title') = :title_eq)")
+        params["title_eq"] = str(filters["title_eq"])
+    if filters.get("author_eq"):
+        where_clauses.append("(e.md_author = :author_eq OR (e.chunk_metadata->>'author') = :author_eq)")
+        params["author_eq"] = str(filters["author_eq"])
+    if filters.get("citation"):
+        where_clauses.append("(e.md_citation = :citation_eq OR (e.chunk_metadata->>'citation') = :citation_eq)")
+        params["citation_eq"] = str(filters["citation"])
+    if filters.get("country"):
+        where_clauses.append("""
+            EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(COALESCE(e.md_countries, e.chunk_metadata->'countries')) AS c(val)
+              WHERE LOWER(c.val) = LOWER(:country)
+            )
+        """)
+        params["country"] = str(filters["country"])
+    if filters.get("title_member"):
+        where_clauses.append("""
+            EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(COALESCE(e.md_titles, e.chunk_metadata->'titles')) AS t(val)
+              WHERE LOWER(t.val) = LOWER(:title_member)
+            )
+        """)
+        params["title_member"] = str(filters["title_member"])
+    if filters.get("citation_member"):
+        where_clauses.append("""
+            EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(COALESCE(e.md_citations, e.chunk_metadata->'citations')) AS c(val)
+              WHERE LOWER(c.val) = LOWER(:citation_member)
+            )
+        """)
+        params["citation_member"] = str(filters["citation_member"])
+    if filters.get("author"):
+        where_clauses.append("(e.md_author_lc % LOWER(:author_approx) OR LOWER(coalesce(e.chunk_metadata->>'author','')) % LOWER(:author_approx))")
+        params["author_approx"] = str(filters["author"])
+    if filters.get("title"):
+        where_clauses.append("(e.md_title_lc % LOWER(:title_approx) OR LOWER(coalesce(e.chunk_metadata->>'title','')) % LOWER(:title_approx))")
+        params["title_approx"] = str(filters["title"])
+    if filters.get("source_approx"):
+        where_clauses.append("""
+            EXISTS (
+              SELECT 1
+              FROM documents d
+              WHERE d.id = e.doc_id
+                AND (d.source_lc % LOWER(:src_approx) OR LOWER(d.source) % LOWER(:src_approx))
+            )
+        """)
+        params["src_approx"] = str(filters["source_approx"])
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    params.update(arr_params)
+    explain_sql = f"""
+    EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, WAL)
+    SELECT e.doc_id, e.chunk_index,
+           (e.vector <=> {array_sql}) AS distance
+    FROM embeddings e
+    {where_sql}
+    ORDER BY e.vector <=> {array_sql} ASC
+    LIMIT :topk
+    """
+    plan = conn.execute(text(explain_sql), params).fetchall()
+    print("\n--- EXPLAIN ANALYZE (vector query) ---")
+    for row in plan:
+        print(row[0])
+
 
 def _build_vector_array_sql(vec: List[float]) -> Tuple[str, Dict[str, Any]]:
     params: Dict[str, Any] = {}
@@ -242,13 +361,13 @@ def run_vector_query(
 
     sql = f"""
     SELECT e.doc_id, e.chunk_index,
-           (e.vector <#> {array_sql}) AS distance,
+           (e.vector <=> {array_sql}) AS distance,
            d.source,
            e.chunk_metadata
     FROM embeddings e
     JOIN documents d ON d.id = e.doc_id
     {where_sql}
-    ORDER BY e.vector <#> {array_sql} ASC
+    ORDER BY e.vector <=> {array_sql} ASC
     LIMIT :topk
     """
     rows = conn.execute(text(sql), params).fetchall()
@@ -703,7 +822,7 @@ def run_ann_with_filters_doc_group(
       SELECT
         e.doc_id,
         e.chunk_index,
-        e.vector <#> {array_sql} AS distance,
+        e.vector <=> {array_sql} AS distance,
         e.md_type, e.md_database, e.md_jurisdiction, e.md_date, e.md_year,
         e.md_title, e.md_author, e.md_countries
       FROM embeddings e, params p
@@ -719,7 +838,7 @@ def run_ann_with_filters_doc_group(
             WHERE LOWER(c.val) = LOWER(p.country)
           )
         )
-      ORDER BY e.vector <#> {array_sql}
+      ORDER BY e.vector <=> {array_sql}
       LIMIT (SELECT top_k FROM params)
     )
     SELECT
@@ -850,6 +969,9 @@ def main():
     ap.add_argument("--runs", type=int, default=5, help="Number of repetitions per test to compute p50/p95")
     ap.add_argument("--use_jit", action="store_true", help="Enable JIT (off by default for lower tail)")
     ap.add_argument("--trgm_limit", type=float, default=None, help="Set trigram similarity threshold via set_limit(value)")
+    ap.add_argument("--explain", action="store_true", help="Print EXPLAIN ANALYZE for the vector query (baseline/ANN)")
+    ap.add_argument("--disable_seqscan", action="store_true", help="SET LOCAL enable_seqscan=off (diagnostic)")
+    ap.add_argument("--effective_io", type=int, default=0, help="SET LOCAL effective_io_concurrency to this value if >0")
 
     # Filters (baseline and optimized)
     ap.add_argument("--type", dest="type_", default=None, help="Exact metadata type (case, legislation, journal, treaty, etc.)")
@@ -891,6 +1013,7 @@ def main():
         _set_session_tuning(conn, use_jit=args.use_jit)
         _set_ivf_probes(conn, args.probes)
         _set_hnsw_ef(conn, args.hnsw_ef)
+        _set_misc(conn, disable_seqscan=bool(args.disable_seqscan), effective_io=(args.effective_io if args.effective_io and int(args.effective_io) > 0 else None))
         conn.execute(text("SELECT 1"))
 
         times: List[float] = []
@@ -926,6 +1049,10 @@ def main():
                 "author": args.author,
                 "title": args.title,
             }
+
+            # Optional: print query plan to ensure the correct vector index is used (e.g., partial IVFFLAT by md_type).
+            if args.explain:
+                _explain_vector_query(conn, query_vec, args.top_k, filters, probes=args.probes, hnsw_ef=args.hnsw_ef, use_jit=args.use_jit)
 
             vec_times: List[float] = []
             fts_times: List[float] = []
