@@ -233,12 +233,13 @@ def _explain_vector_query(
 
 def _build_vector_array_sql(vec: List[float]) -> Tuple[str, Dict[str, Any]]:
     """
-    Return a single bind param usable as :qv::vector to maximize index-ability.
-    Passing a single vector parameter typically yields better plans for pgvector
+    Return a single bind param usable as (:qv)::vector to maximize index-ability.
+    Using parentheses ensures SQLAlchemy/psycopg2 recognizes the :qv bind and
+    PostgreSQL parses the cast correctly. This typically yields better plans
     than constructing ARRAY[:v0,:v1,...]::vector in the ORDER BY expression.
     """
     s = "[" + ",".join(f"{float(v):.6f}" for v in vec) + "]"
-    return ":qv::vector", {"qv": s}
+    return "(:qv)::vector", {"qv": s}
 
 
 # =========================
