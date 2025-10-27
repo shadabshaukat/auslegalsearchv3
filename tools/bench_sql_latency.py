@@ -73,6 +73,13 @@ import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+import os, sys
+# Ensure project root on sys.path when invoked as a script (e.g., "python3 tools/bench_sql_latency.py").
+# This allows "from db.connector import engine" and "from embedding.embedder import Embedder" to resolve.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from db.connector import engine
