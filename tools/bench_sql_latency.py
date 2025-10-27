@@ -595,7 +595,7 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
         FROM (
           SELECT e2.md_title AS t
           FROM embeddings e2
-          WHERE e2.doc_id = e.doc_id AND e2.md_title IS NOT NULL
+          WHERE e2.doc_id = d.id AND e2.md_title IS NOT NULL
         ) s
       ) AS case_name
     FROM embeddings e
@@ -761,7 +761,7 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
       e.md_title AS title,
       e.md_author AS author,
       e.md_date AS date,
-      similarity(e.md_title_lc, LOWER(:q)) AS score
+      MAX(similarity(e.md_title_lc, LOWER(:q))) AS score
     FROM embeddings e
     JOIN documents d ON d.id = e.doc_id
     WHERE e.md_type = ANY(:types)
