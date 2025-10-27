@@ -71,36 +71,55 @@
 -- =====================================================================
 WITH params AS (
   SELECT $1::text[] AS citations
+),
+matched AS (
+  SELECT DISTINCT e.doc_id
+  FROM embeddings e, params p
+  WHERE e.md_type = 'case'
+    AND (
+      (e.md_citation IS NOT NULL AND lower(e.md_citation) = ANY(p.citations))
+      OR EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements_text(COALESCE(e.md_citations, '[]'::jsonb)) AS c(val)
+        WHERE lower(c.val) = ANY(p.citations)
+      )
+    )
+),
+names AS (
+  SELECT
+    e2.doc_id,
+    MAX(e2.md_date) AS case_date,
+    MAX(e2.md_jurisdiction) AS jurisdiction,
+    MAX(e2.md_database) AS court,
+    MIN(
+      COALESCE(
+        e2.md_citation,
+        (SELECT min(x) FROM jsonb_array_elements_text(COALESCE(e2.md_citations, '[]'::jsonb)) AS x(x))
+      )
+    ) AS citation,
+    (
+      SELECT string_agg(DISTINCT t, '; ')
+      FROM (
+        SELECT e3.md_title AS t
+        FROM embeddings e3
+        WHERE e3.doc_id = e2.doc_id AND e3.md_title IS NOT NULL
+      ) s
+    ) AS case_name
+  FROM embeddings e2
+  JOIN matched m ON m.doc_id = e2.doc_id
+  GROUP BY e2.doc_id
 )
 SELECT
-  d.id AS doc_id,
+  n.doc_id,
   d.source AS url,
-  e.md_jurisdiction AS jurisdiction,
-  e.md_date AS case_date,
-  e.md_database AS court,
-  COALESCE(e.md_citation, (SELECT min(x) FROM jsonb_array_elements_text(e.md_citations) AS x)) AS citation,
-  (
-    SELECT string_agg(DISTINCT t, '; ')
-    FROM (
-      SELECT e2.md_title AS t
-      FROM embeddings e2
-      WHERE e2.doc_id = e.doc_id AND e2.md_title IS NOT NULL
-    ) s
-  ) AS case_name
-FROM embeddings e
-JOIN documents d ON d.id = e.doc_id
-CROSS JOIN params p
-WHERE e.md_type = 'case'
-  AND (
-    (e.md_citation IS NOT NULL AND lower(e.md_citation) = ANY(p.citations))
-    OR EXISTS (
-      SELECT 1
-      FROM jsonb_array_elements_text(COALESCE(e.md_citations, '[]'::jsonb)) AS c(val)
-      WHERE lower(c.val) = ANY(p.citations)
-    )
-  )
-GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database, e.md_citation
-ORDER BY e.md_date DESC;
+  n.jurisdiction AS jurisdiction,
+  n.case_date AS case_date,
+  n.court AS court,
+  n.citation AS citation,
+  n.case_name AS case_name
+FROM names n
+JOIN documents d ON d.id = n.doc_id
+ORDER BY n.case_date DESC;
 
 
 -- =====================================================================
@@ -304,22 +323,30 @@ LIMIT (SELECT lim FROM params);
 -- =====================================================================
 WITH params AS (
   SELECT LOWER($1::text) AS q, $2::text[] AS types, $3::int AS lim
+),
+scored AS (
+  SELECT
+    e.doc_id,
+    d.source AS url,
+    e.md_type AS type,
+    e.md_title AS title,
+    e.md_author AS author,
+    e.md_date AS date,
+    similarity(e.md_title_lc, p.q) AS score
+  FROM embeddings e
+  JOIN documents d ON d.id = e.doc_id
+  CROSS JOIN params p
+  WHERE e.md_type = ANY(p.types)
+    AND (e.md_title_lc % p.q)
+),
+ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY score DESC, date DESC) AS rn
+  FROM scored
 )
-SELECT
-  d.id AS doc_id,
-  d.source AS url,
-  e.md_type AS type,
-  e.md_title AS title,
-  e.md_author AS author,
-  e.md_date AS date,
-  similarity(e.md_title_lc, p.q) AS score
-FROM embeddings e
-JOIN documents d ON d.id = e.doc_id
-CROSS JOIN params p
-WHERE e.md_type = ANY(p.types)
-  AND (e.md_title_lc % p.q)
-GROUP BY d.id, d.source, e.md_type, e.md_title, e.md_author, e.md_date
-ORDER BY score DESC, e.md_date DESC
+SELECT doc_id, url, type, title, author, date, score
+FROM ranked
+WHERE rn = 1
+ORDER BY score DESC, date DESC
 LIMIT (SELECT lim FROM params);
 
 

@@ -578,39 +578,47 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
     """
     t0 = _now_ms()
     sql = """
+    WITH matched AS (
+      SELECT DISTINCT e.doc_id
+      FROM embeddings e
+      WHERE e.md_type = 'case'
+        AND (
+          (e.md_citation IS NOT NULL AND lower(e.md_citation) = ANY(:citations))
+          OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(COALESCE(e.md_citations, '[]'::jsonb)) AS c(val)
+            WHERE lower(c.val) = ANY(:citations)
+          )
+        )
+    ),
+    names AS (
+      SELECT
+        e2.doc_id,
+        MAX(e2.md_date) AS case_date,
+        MAX(e2.md_jurisdiction) AS jurisdiction,
+        MAX(e2.md_database) AS court,
+        MIN(
+          COALESCE(
+            e2.md_citation,
+            (SELECT min(x) FROM jsonb_array_elements_text(COALESCE(e2.md_citations,'[]'::jsonb)) AS x(x))
+          )
+        ) AS citation,
+        MIN(e2.md_title) FILTER (WHERE e2.md_title IS NOT NULL) AS case_name
+      FROM embeddings e2
+      JOIN matched m ON m.doc_id = e2.doc_id
+      GROUP BY e2.doc_id
+    )
     SELECT
-      d.id AS doc_id,
+      n.doc_id,
       d.source AS url,
-      e.md_jurisdiction AS jurisdiction,
-      e.md_date AS case_date,
-      e.md_database AS court,
-      MIN(
-        COALESCE(
-          e.md_citation,
-          (SELECT min(x) FROM jsonb_array_elements_text(COALESCE(e.md_citations,'[]'::jsonb)) AS x(x))
-        )
-      ) AS citation,
-      (
-        SELECT string_agg(DISTINCT t, '; ')
-        FROM (
-          SELECT e2.md_title AS t
-          FROM embeddings e2
-          WHERE e2.doc_id = d.id AND e2.md_title IS NOT NULL
-        ) s
-      ) AS case_name
-    FROM embeddings e
-    JOIN documents d ON d.id = e.doc_id
-    WHERE e.md_type = 'case'
-      AND (
-        (e.md_citation IS NOT NULL AND lower(e.md_citation) = ANY(:citations))
-        OR EXISTS (
-          SELECT 1
-          FROM jsonb_array_elements_text(COALESCE(e.md_citations, '[]'::jsonb)) AS c(val)
-          WHERE lower(c.val) = ANY(:citations)
-        )
-      )
-    GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database
-    ORDER BY e.md_date DESC
+      n.jurisdiction,
+      n.case_date,
+      n.court,
+      n.citation,
+      n.case_name
+    FROM names n
+    JOIN documents d ON d.id = n.doc_id
+    ORDER BY n.case_date DESC
     """
     rows = conn.execute(text(sql), {"citations": citations}).fetchall()
     hits = []
@@ -754,20 +762,24 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
     t0 = _now_ms()
     _set_trgm_limit(conn, trgm_limit)
     sql = """
-    SELECT
-      d.id AS doc_id,
-      d.source AS url,
-      e.md_type AS type,
-      e.md_title AS title,
-      e.md_author AS author,
-      e.md_date AS date,
-      MAX(similarity(e.md_title_lc, LOWER(:q))) AS score
-    FROM embeddings e
-    JOIN documents d ON d.id = e.doc_id
-    WHERE e.md_type = ANY(:types)
-      AND (e.md_title_lc % LOWER(:q))
-    GROUP BY d.id, d.source, e.md_type, e.md_title, e.md_author, e.md_date
-    ORDER BY score DESC, e.md_date DESC
+    WITH scored AS (
+      SELECT
+        e.doc_id,
+        e.md_type AS type, e.md_title AS title, e.md_author AS author, e.md_date AS date,
+        similarity(e.md_title_lc, LOWER(:q)) AS score
+      FROM embeddings e
+      WHERE e.md_type = ANY(:types)
+        AND (e.md_title_lc % LOWER(:q))
+    ),
+    ranked AS (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY score DESC, date DESC) AS rn
+      FROM scored
+    )
+    SELECT r.doc_id, d.source AS url, r.type, r.title, r.author, r.date, r.score
+    FROM ranked r
+    JOIN documents d ON d.id = r.doc_id
+    WHERE r.rn = 1
+    ORDER BY r.score DESC, r.date DESC
     LIMIT :lim
     """
     rows = conn.execute(text(sql), {"q": title, "types": types, "lim": int(limit)}).fetchall()
