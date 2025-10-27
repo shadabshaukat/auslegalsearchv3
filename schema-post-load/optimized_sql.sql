@@ -1,3 +1,39 @@
+-- =====================================================================
+-- AUSLegalSearch v3 — Optimized SQL Templates (Documented)
+--
+-- Purpose:
+--   Curated query templates for high-performance legal search, aligned
+--   with the post-load schema/indexing strategy:
+--     - Generated STORED columns: md_* derived from embeddings.chunk_metadata
+--     - BTree equality/range on: md_type, md_jurisdiction, md_database,
+--       md_date, md_year, md_title, md_author, md_citation
+--     - Trigram GIN on: md_title_lc, md_author_lc (pg_trgm)
+--     - GIN on arrays: md_countries, md_titles, md_citations
+--     - Vector ANN (pgvector): IVFFLAT/HNSW with vector_cosine_ops, using
+--       cosine operator (<=>) for index use
+--     - documents.source trigram: lower(source) GIN (pg_trgm)
+--
+-- Notes:
+--   - Always prefer equality/range filters on md_* STORED columns to enable
+--     selective btree pruning and partial index usage (e.g., md_type).
+--   - ANN uses cosine operator (<=>) to match vector_cosine_ops opclass.
+--   - For IVFFLAT, tune ivfflat.probes at runtime. For HNSW, tune hnsw.ef_search.
+--   - Apply cohort prefilters (md_type/jurisdiction/database/year/date) to shrink
+--     candidates before ANN ordering.
+-- =====================================================================
+
+
+-- =====================================================================
+-- 1) Cases by Citation (Exact)
+-- What it does:
+--   Finds case documents by exact citation match from either the single
+--   md_citation or any member of md_citations[] (normalized lowercase).
+-- Why it’s fast (indexes used):
+--   - md_type = 'case' leverages btree on md_type
+--   - Equality test on md_citation (btree)
+--   - Membership test on md_citations via GIN (jsonb array)
+--   - No vector search here; purely metadata filters and join
+-- =====================================================================
 WITH params AS (
   SELECT $1::text[] AS citations
 )
@@ -31,6 +67,17 @@ WHERE e.md_type = 'case'
 GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database, e.md_citation
 ORDER BY e.md_date DESC;
 
+
+-- =====================================================================
+-- 2) Cases by Name (Trigram)
+-- What it does:
+--   Approximate match (trigram) against case/party name on md_title_lc.
+--   Optional filters: jurisdiction/year/court(database). Ranks by similarity.
+-- Why it’s fast (indexes used):
+--   - Trigram GIN on md_title_lc (pg_trgm)
+--   - BTree filters on md_jurisdiction/md_year/md_database
+--   - md_type = 'case' narrows scope by cohort
+-- =====================================================================
 WITH params AS (
   SELECT LOWER($1::text) AS q,
          $2::text AS jurisdiction,
@@ -63,6 +110,17 @@ WHERE e.md_type = 'case'
 GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database
 ORDER BY name_similarity DESC, e.md_date DESC;
 
+
+-- =====================================================================
+-- 3) Cases by Name (Levenshtein)
+-- What it does:
+--   Uses Levenshtein edit distance against md_title_lc with optional
+--   jurisdiction/year/court filters. Slower, but precise refinement.
+-- Why it’s fast(er) than naive:
+--   - Still benefits from equality filters on md_* btree columns
+--   - Note: Levenshtein is CPU-intensive; use low max_dist or combine
+--     with trigram prefilter upstream for best performance
+-- =====================================================================
 WITH params AS (
   SELECT LOWER($1::text) AS q,
          $2::int AS max_dist,
@@ -99,6 +157,17 @@ WHERE e.md_type = 'case'
 GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database
 ORDER BY MIN(levenshtein(e.md_title_lc, p.q)) ASC, e.md_date DESC;
 
+
+-- =====================================================================
+-- 4) Legislation by Title (Trigram)
+-- What it does:
+--   Finds legislation by approximate title using trigram on md_title_lc,
+--   with optional jurisdiction/year/database filters.
+-- Why it’s fast (indexes used):
+--   - md_type = 'legislation' (btree)
+--   - Trigram GIN on md_title_lc
+--   - BTree on md_jurisdiction/md_year/md_database
+-- =====================================================================
 WITH params AS (
   SELECT LOWER($1::text) AS q,
          $2::text AS jurisdiction,
@@ -125,6 +194,16 @@ WHERE e.md_type = 'legislation'
 ORDER BY score DESC, e.md_date DESC
 LIMIT (SELECT lim FROM params);
 
+
+-- =====================================================================
+-- 5) Title Search by Types (Trigram)
+-- What it does:
+--   Title search across a provided list of types (e.g., treaty, journal),
+--   using trigram on md_title_lc and returning a similarity score.
+-- Why it’s fast (indexes used):
+--   - md_type IN (...) (btree on md_type)
+--   - Trigram GIN on md_title_lc
+-- =====================================================================
 WITH params AS (
   SELECT LOWER($1::text) AS q, $2::text[] AS types, $3::int AS lim
 )
@@ -145,6 +224,25 @@ GROUP BY d.id, d.source, e.md_type, e.md_title, e.md_author, e.md_date
 ORDER BY score DESC, e.md_date DESC
 LIMIT (SELECT lim FROM params);
 
+
+-- =====================================================================
+-- 6) ANN Vector Search with Filters (+ Doc Grouping Pattern)
+-- What it does:
+--   Performs cosine ANN over embeddings.vector with metadata equality/range
+--   filters, optional country membership, and optional trigram approx filters
+--   on author/title/source after ANN shortlist. Results include top-k chunks
+--   per the ANN ordering and are doc-joined for source URL.
+-- Why it’s fast (indexes used):
+--   - Vector ANN index (IVFFLAT or HNSW) with vector_cosine_ops and <=> operator
+--     • If cohort filter present (md_type), planner can pick partial vector index
+--     • Otherwise planner can use a global vector index
+--   - BTree on md_type/md_database/md_jurisdiction/md_date/md_year
+--   - GIN on md_countries for membership test
+--   - Trigram GIN on (lower(author/title)) post-ANN refinement (low N)
+-- Tuning:
+--   - Set ivfflat.probes or hnsw.ef_search per session for recall/latency trade-off
+--   - Keep candidate set small with cohort/date filters for best p95
+-- =====================================================================
 WITH params AS (
   SELECT
     $2::int AS top_k,
@@ -197,6 +295,17 @@ WHERE
 ORDER BY a.distance ASC
 LIMIT (SELECT top_k FROM params);
 
+
+-- =====================================================================
+-- 7) Approximate Title Search with Doc-level Grouping
+-- What it does:
+--   Computes trigram similarity on md_title_lc with optional filters,
+--   then picks the best (highest-similarity) title per doc_id using ROW_NUMBER.
+-- Why it’s fast (indexes used):
+--   - Trigram GIN on md_title_lc
+--   - BTree on md_type/md_jurisdiction/md_database/md_year
+--   - Doc-level grouping reduces duplicates for display
+-- =====================================================================
 WITH params AS (
   SELECT LOWER($1::text) AS q, $2::text AS type, $3::text AS jurisdiction, $4::text AS database, $5::int AS year, $6::int AS lim
 ),
@@ -224,6 +333,15 @@ WHERE rn = 1
 ORDER BY score DESC, md_date DESC
 LIMIT (SELECT lim FROM params);
 
+
+-- =====================================================================
+-- 8) Approximate documents.source (Trigram)
+-- What it does:
+--   Fuzzy matches input against documents.source (lowercased), useful for
+--   filtering by site/collection labels (e.g., 'nswcaselaw', 'legislation').
+-- Why it’s fast (indexes used):
+--   - Trigram GIN on lower(source) for approximate matching
+-- =====================================================================
 SELECT id AS doc_id, source AS url
 FROM documents
 WHERE lower(source) % LOWER($1::text)

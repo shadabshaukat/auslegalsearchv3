@@ -144,22 +144,22 @@ def _explain_vector_query(
     params: Dict[str, Any] = {"topk": int(top_k)}
     # Match the same filter shape as run_vector_query
     if filters.get("type"):
-        where_clauses.append("(e.md_type = :type_exact OR (e.chunk_metadata->>'type') = :type_exact)")
+        where_clauses.append("(e.md_type = :type_exact)")
         params["type_exact"] = str(filters["type"])
     if filters.get("jurisdiction"):
-        where_clauses.append("(e.md_jurisdiction = :jurisdiction_exact OR (e.chunk_metadata->>'jurisdiction') = :jurisdiction_exact)")
+        where_clauses.append("(e.md_jurisdiction = :jurisdiction_exact)")
         params["jurisdiction_exact"] = str(filters["jurisdiction"])
     if filters.get("subjurisdiction"):
-        where_clauses.append("(e.md_subjurisdiction = :subjurisdiction_exact OR (e.chunk_metadata->>'subjurisdiction') = :subjurisdiction_exact)")
+        where_clauses.append("(e.md_subjurisdiction = :subjurisdiction_exact)")
         params["subjurisdiction_exact"] = str(filters["subjurisdiction"])
     if filters.get("database"):
-        where_clauses.append("(e.md_database = :database_exact OR (e.chunk_metadata->>'database') = :database_exact)")
+        where_clauses.append("(e.md_database = :database_exact)")
         params["database_exact"] = str(filters["database"])
     if filters.get("year") is not None:
-        where_clauses.append("(e.md_year = :year_exact OR ((e.chunk_metadata->>'year')::int) = :year_exact)")
+        where_clauses.append("(e.md_year = :year_exact)")
         params["year_exact"] = int(filters["year"])
     if filters.get("date_from") and filters.get("date_to"):
-        where_clauses.append("((e.md_date BETWEEN :df AND :dt) OR ((e.chunk_metadata->>'date')::date BETWEEN :df AND :dt))")
+        where_clauses.append("(e.md_date BETWEEN :df AND :dt)")
         params["df"] = str(filters["date_from"])
         params["dt"] = str(filters["date_to"])
     if filters.get("title_eq"):
@@ -232,14 +232,13 @@ def _explain_vector_query(
 
 
 def _build_vector_array_sql(vec: List[float]) -> Tuple[str, Dict[str, Any]]:
-    params: Dict[str, Any] = {}
-    parts = []
-    for i, v in enumerate(vec):
-        key = f"v{i}"
-        parts.append(f":{key}")
-        params[key] = float(v)
-    array_sql = "ARRAY[" + ",".join(parts) + "]::vector"
-    return array_sql, params
+    """
+    Return a single bind param usable as :qv::vector to maximize index-ability.
+    Passing a single vector parameter typically yields better plans for pgvector
+    than constructing ARRAY[:v0,:v1,...]::vector in the ORDER BY expression.
+    """
+    s = "[" + ",".join(f"{float(v):.6f}" for v in vec) + "]"
+    return ":qv::vector", {"qv": s}
 
 
 # =========================
@@ -265,27 +264,27 @@ def run_vector_query(
 
     # Equality filters on JSON metadata (prefer stored columns if present; fallback to JSONB)
     if filters.get("type"):
-        where_clauses.append("(e.md_type = :type_exact OR (e.chunk_metadata->>'type') = :type_exact)")
+        where_clauses.append("(e.md_type = :type_exact)")
         params["type_exact"] = str(filters["type"])
 
     if filters.get("jurisdiction"):
-        where_clauses.append("(e.md_jurisdiction = :jurisdiction_exact OR (e.chunk_metadata->>'jurisdiction') = :jurisdiction_exact)")
+        where_clauses.append("(e.md_jurisdiction = :jurisdiction_exact)")
         params["jurisdiction_exact"] = str(filters["jurisdiction"])
 
     if filters.get("subjurisdiction"):
-        where_clauses.append("(e.md_subjurisdiction = :subjurisdiction_exact OR (e.chunk_metadata->>'subjurisdiction') = :subjurisdiction_exact)")
+        where_clauses.append("(e.md_subjurisdiction = :subjurisdiction_exact)")
         params["subjurisdiction_exact"] = str(filters["subjurisdiction"])
 
     if filters.get("database"):
-        where_clauses.append("(e.md_database = :database_exact OR (e.chunk_metadata->>'database') = :database_exact)")
+        where_clauses.append("(e.md_database = :database_exact)")
         params["database_exact"] = str(filters["database"])
 
     if filters.get("year") is not None:
-        where_clauses.append("(e.md_year = :year_exact OR ((e.chunk_metadata->>'year')::int) = :year_exact)")
+        where_clauses.append("(e.md_year = :year_exact)")
         params["year_exact"] = int(filters["year"])
 
     if filters.get("date_from") and filters.get("date_to"):
-        where_clauses.append("((e.md_date BETWEEN :df AND :dt) OR ((e.chunk_metadata->>'date')::date BETWEEN :df AND :dt))")
+        where_clauses.append("(e.md_date BETWEEN :df AND :dt)")
         params["df"] = str(filters["date_from"])
         params["dt"] = str(filters["date_to"])
 
