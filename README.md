@@ -2,26 +2,147 @@
 
 ---
 
-## 🚀 New in v3: Agentic RAG with Chain-of-Thought Reasoning
+## Quick Deployment Guide
 
-**AUSLegalSearchv3 now includes Agentic Chain-of-Thought RAG — a world-class, explainable, multi-step reasoning engine for legal and compliance practitioners.**
+1) System prerequisites
+```sh
+sudo apt update && sudo apt upgrade -y
+sudo apt install python3 python3-venv python3-pip git postgresql libpq-dev gcc unzip curl -y
+```
 
-- **Agentic Chat Tab:** Natural language questions yield stepwise, structured reasoning (Chain-of-Thought, CoT). Each agentic answer details "Thought", "Action", "Evidence", "Reasoning", and "Conclusion" steps—driving trustworthy, auditable outcomes.
-- **Interactive UI:** Each CoT answer is shown with visual timeline cards and clear source citations, for legal-grade explainability.
-- **Seamless Model Switching:** Instantly toggle between local Ollama LLMs and Oracle Cloud GenAI for agentic RAG.
-- **Professional User Experience:** All tabs present clear progress/wait-state animations, robust error handling, and a big-tech–grade, modern UX.
-- **Reproducible Reasoning:** Every answer’s “chain” is preserved for transparency, audit, or retraining.
+2) Clone, prepare, and install dependencies
+```sh
+git clone https://github.com/shadabshaukat/auslegalsearchv3.git
+cd auslegalsearchv3
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+Notes:
+- Requirements include oci and oracledb for full Oracle GenAI and Oracle 23ai DB coverage.
+- pgvector must be installed/enabled on your PostgreSQL target.
 
-### Example: UI Chain-of-Thought Flow
+3) Configure environment variables
 
-![Example: Chain-of-Thought UI](agentic_cot_ui.png)
+Database (Postgres):
+```sh
+export AUSLEGALSEARCH_DB_HOST=localhost
+export AUSLEGALSEARCH_DB_PORT=5432
+export AUSLEGALSEARCH_DB_USER=postgres
+export AUSLEGALSEARCH_DB_PASSWORD='YourPasswordHere'
+export AUSLEGALSEARCH_DB_NAME=postgres
+# Optional single DSN override:
+# export AUSLEGALSEARCH_DB_URL='postgresql+psycopg2://user:pass@host:5432/dbname'
+```
+
+API/Backend:
+```sh
+export FASTAPI_API_USER=legal_api
+export FASTAPI_API_PASS=letmein
+export AUSLEGALSEARCH_API_URL=http://localhost:8000
+```
+
+Oracle Cloud GenAI (optional):
+```sh
+export OCI_USER_OCID='ocid1.user.oc1...'
+export OCI_TENANCY_OCID='ocid1.tenancy.oc1...'
+export OCI_KEY_FILE='/path/to/oci_api_key.pem'
+export OCI_KEY_FINGERPRINT='xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx'
+export OCI_REGION='ap-sydney-1'
+export OCI_COMPARTMENT_OCID='ocid1.compartment.oc1...'
+export OCI_GENAI_MODEL_OCID='ocid1.generativeaiocid...'
+```
+
+Oracle 23ai DB integration (optional):
+```sh
+export ORACLE_DB_USER='your_db_user'
+export ORACLE_DB_PASSWORD='your_db_password'
+export ORACLE_DB_DSN='your_db_high'
+export ORACLE_WALLET_LOCATION='/path/to/wallet/dir'
+```
+
+Embedding model (defaults are sensible):
+```sh
+export AUSLEGALSEARCH_EMBED_MODEL='nomic-ai/nomic-embed-text-v1.5'
+export AUSLEGALSEARCH_EMBED_DIM=768
+export AUSLEGALSEARCH_EMBED_BATCH=64
+```
+
+4) Network and ports
+- Open: 8000 (FastAPI), 7866–7879 (Gradio), 8501 (Streamlit).
+```sh
+sudo iptables -I INPUT -p tcp --dport 8000 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 7866:7879 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 8501 -j ACCEPT
+```
+
+5) Launch the stack
+```sh
+bash run_legalsearch_stack.sh
+# To stop:
+bash stop_legalsearch_stack.sh
+# Gradio:   http://localhost:7866
+# FastAPI:  http://localhost:8000
+# Streamlit http://localhost:8501
+```
+
+For production, secure endpoints behind WAF/reverse proxy and TLS. Store secrets in environment or a secret manager.
+
+---
+
+## Documentation Index
+
+- Ingestion (Beta) Pipeline: [ingest/README.md](ingest/README.md)
+- Embedding Subsystem: [embedding/README.md](embedding/README.md)
+- Database Layer (Postgres + pgvector + FTS + Oracle 23ai connector): [db/README.md](db/README.md)
+- RAG Pipelines (Ollama and OCI GenAI): [rag/README.md](rag/README.md)
+- Streamlit UI (Login + Chat): [pages/README.md](pages/README.md)
+- Tools: SQL Latency Benchmark (p50/p95, vector/FTS/metadata, and optimized SQL scenarios): [tools/README.md](tools/README.md)
+- Post-load Indexing & Metadata Strategy (TB-scale): [schema-post-load/README.md](schema-post-load/README.md)
+- Optimized SQL templates (citation/name/title/source, ANN, grouping): [schema-post-load/optimized_sql.sql](schema-post-load/optimized_sql.sql)
+- Beta Data Load Guide (end-to-end ingest runbook): [docs/BetaDataLoad.md](docs/BetaDataLoad.md)
+
+Other helpful docs:
+- Gradio API/UX: [docs/API_SPEC_GRADIO.md](docs/API_SPEC_GRADIO.md)
+- Deployment notes (TLS, Nginx, Let’s Encrypt): [docs/setup_letsencrypt_streamlit_nginx.md](docs/setup_letsencrypt_streamlit_nginx.md), [docs/setup_letsencrypt_oracle_lb.md](docs/setup_letsencrypt_oracle_lb.md)
+- AWS/OCI helpers: [docs/awscli_install_instructions.md](docs/awscli_install_instructions.md), [oci_models_debug.json](oci_models_debug.json)
+
+---
+
+## Platform Overview
+
+- Agentic Chain-of-Thought RAG
+  - Stepwise, explainable legal answers with Thought/Action/Evidence/Reasoning and Final Conclusion structure; auditable and reproducible.
+- Model endpoints
+  - Switch between local Ollama models and Oracle Cloud GenAI seamlessly.
+- Retrieval modes
+  - Vector (pgvector cosine), BM25-like (ILIKE), Hybrid, FTS (tsvector); metadata-aware filtering and chunk metadata search.
+- Applications
+  - FastAPI REST API for search, RAG, agentic chat, Oracle 23ai proxy.
+  - Streamlit chat UI with hybrid retrieval and source cards.
+  - Gradio UI for hybrid/vector/OCI GenAI demos.
+
+### Main components
+
+- Ingestion (Beta)
+  - Multi-GPU orchestrator and per-GPU worker with CPU/GPU pipelining, token-aware semantic chunking (dashed-header aware), batched embedding, DB persistence, per-file metrics, and resumability.
+- Embeddings
+  - Sentence-Transformers primary; HuggingFace AutoModel fallback with mean pooling; configurable batch size and revisions; dimension must match DB.
+- Database
+  - PostgreSQL + pgvector, FTS maintenance via trigger; post-load DDLs surface md_* generated/expression columns for optimized filters; optional Oracle 23ai connector.
+- RAG
+  - Ollama and OCI GenAI pipelines format metadata-rich context and enforce legal-grade prompts; Agentic CoT endpoints exposed via FastAPI.
+- UIs
+  - Streamlit (login + chat) and Gradio (LLM/Cloud tabs); professional UX with progress, error handling, and citations.
+- Tools
+  - Benchmark utility for p50/p95 latency across vector/FTS/metadata, plus optimized SQL scenarios (citations, names, titles, sources, ANN + grouping).
 
 ---
 
 ## Architecture and Workflow
 
 <img width="2548" height="2114" alt="AusLegalSearchv3" src="https://github.com/user-attachments/assets/d90a5d18-d769-44b9-a6b8-5e75ba47727c" />
-
 
 ### System Overview
 
@@ -50,17 +171,6 @@
 ### Agentic RAG Chain-of-Thought Workflow
 
 <img width="2000" height="12600" alt="image" src="https://github.com/user-attachments/assets/05148d8c-1327-47da-99ee-5c4e6421e7f8" />
-
-
----
-
-## Key Capabilities
-
-- **Agentic Chain-of-Thought RAG:** Legal query explanations as auditable, step-wise deductive timelines—unmatched for risk, compliance, research traceability.
-- **LLM Source Diversity:** Run RAG and Agentic queries using either Ollama or Oracle Cloud GenAI—one switch, zero config hassle.
-- **GenAI QA & RAG Tab:** Configure Oracle GenAI, see live status, and benchmark against local models instantly.
-- **Hybrid / Vector / BM25 Retrieval:** Pick search mode as needed; results are always shown with context, sources, and explainability.
-- **Plug-and-Play Backend:** All services—REST API, UI, Oracle DB, and PGVector—run together with clear network separation.
 
 ---
 
@@ -108,7 +218,7 @@ AUSLEGALSEARCH_DB_POOL_TIMEOUT=30
 ```
 
 Run orchestrator (full dataset)
-```
+```sh
 python3 -m ingest.beta_orchestrator \
   --root "/path/to/Data_for_Beta_Launch" \
   --session "beta-full-$(date +%Y%m%d-%H%M%S)" \
@@ -119,7 +229,7 @@ python3 -m ingest.beta_orchestrator \
 ```
 
 Resume a stuck child on “remaining files” only
-```
+```sh
 session=beta-full-YYYYMMDD-HHMMSS
 child=${session}-gpu3
 proj=/abs/path/auslegalsearchv3
@@ -131,6 +241,7 @@ cat "$logs/${child}.error.log" 2>/dev/null >> /tmp/processed_g3.txt
 sort -u /tmp/processed_g3.txt -o /tmp/processed_g3.txt
 sort -u "$part" -o /tmp/partition_g3.txt
 comm -23 /tmp/partition_g3.txt /tmp/processed_g3.txt > "$proj/.beta-gpu-partition-${child}-remaining.txt"
+
 CUDA_VISIBLE_DEVICES=3 \
 python3 -m ingest.beta_worker ${child}-r1 \
   --partition_file "$proj/.beta-gpu-partition-${child}-remaining.txt" \
@@ -139,106 +250,17 @@ python3 -m ingest.beta_worker ${child}-r1 \
   --log_dir "$logs"
 ```
 
-For full details see docs/BetaDataLoad.md.
-
-
-## Deployment Instructions
-
-### 1. System Prerequisites
-
-```sh
-sudo apt update && sudo apt upgrade -y
-sudo apt install python3 python3-venv python3-pip git postgresql libpq-dev gcc unzip curl -y
-```
-
-### 2. Clone, Prepare, and Install Dependencies
-
-```sh
-git clone https://github.com/shadabshaukat/auslegalsearchv3.git
-cd auslegalsearchv3
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-> Requirements include [oci](https://pypi.org/project/oci/) and [oracledb](https://pypi.org/project/oracledb/) for full GenAI and DB coverage.
-
-### 3. Environment Variables (v3+)
-
-**Database Setup:**
-```
-export AUSLEGALSEARCH_DB_HOST=localhost
-export AUSLEGALSEARCH_DB_PORT=5432
-export AUSLEGALSEARCH_DB_USER=postgres
-export AUSLEGALSEARCH_DB_PASSWORD='YourPasswordHere'
-export AUSLEGALSEARCH_DB_NAME=postgres
-```
-
-**API/Backend:**
-```
-export FASTAPI_API_USER=legal_api
-export FASTAPI_API_PASS=letmein
-export AUSLEGALSEARCH_API_URL=http://localhost:8000
-```
-
-**Oracle Cloud GenAI:**
-```
-export OCI_USER_OCID='ocid1.user.oc1...'
-export OCI_TENANCY_OCID='ocid1.tenancy.oc1...'
-export OCI_KEY_FILE='/path/to/oci_api_key.pem'
-export OCI_KEY_FINGERPRINT='xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx'
-export OCI_REGION='ap-sydney-1'
-export OCI_COMPARTMENT_OCID='ocid1.compartment.oc1...'
-export OCI_GENAI_MODEL_OCID='ocid1.generativeaiocid...'
-```
-
-**Oracle 23ai DB integration (optional):**
-```
-export ORACLE_DB_USER='your_db_user'
-export ORACLE_DB_PASSWORD='your_db_password'
-export ORACLE_DB_DSN='your_db_high'
-export ORACLE_WALLET_LOCATION='/path/to/wallet/dir'
-```
-
----
-
-### 4. Network & Database Setup
-
-- PostgreSQL, PGVector, and any Oracle DBs as per your needs.
-- Open for: 8000 (FastAPI), 7866–7879 (Gradio), 8501 (Streamlit).
-- Example:
-```sh
-sudo iptables -I INPUT -p tcp --dport 8000 -j ACCEPT
-sudo iptables -I INPUT -p tcp --dport 7866:7879 -j ACCEPT
-sudo iptables -I INPUT -p tcp --dport 8501 -j ACCEPT
-```
-
----
-
-### 5. Launch
-
-```sh
-bash run_legalsearch_stack.sh
-# To stop: bash stop_legalsearch_stack.sh
-# Gradio:   http://localhost:7866
-# FastAPI:  http://localhost:8000
-# Streamlit http://localhost:8501
-```
-
 ---
 
 ## API Specification
 
-### `/chat/agentic` — Agentic Chain-of-Thought LLM Endpoint
+### POST /chat/agentic — Agentic Chain-of-Thought LLM Endpoint
 
-Submit a legal or compliance question and receive a structured chain-of-thought reasoning trace with cited sources.
-
-**POST** `/chat/agentic`
-#### Request
+Request:
 ```json
 {
-  "llm_source": "ollama",           // or "oci_genai"
-  "model": "llama3" | "orca-mini" | ...,
+  "llm_source": "ollama",
+  "model": "llama3",
   "message": "Explain the procedure for contesting a will in NSW.",
   "chat_history": [],
   "system_prompt": "...",
@@ -247,59 +269,38 @@ Submit a legal or compliance question and receive a structured chain-of-thought 
   "max_tokens": 1920,
   "repeat_penalty": 1.07,
   "top_k": 12,
-  "oci_config": {
-    "compartment_id": "...", "model_id": "...", "region": "ap-sydney-1"
-  }
+  "oci_config": {"compartment_id": "...", "model_id": "...", "region": "ap-sydney-1"}
 }
 ```
 
-#### Response
+Response:
 ```json
 {
-  "answer": "Step 1 - Thought: ...\nStep 2 - Action: ...\nFinal Conclusion: ...", // Markdown Chain-of-Thought trace
-  "sources": [
-    "Succession Act 2006 (NSW) s 96", "Practical Law Practice Note", "Case: Smith v Doe [2022] NSWSC 789"
-  ],
-  "chunk_metadata": [
-    {"citation": "Succession Act 2006 (NSW) s 96", "url": "https://legislation.nsw.gov.au/view/html/inforce/current/act-2006-080#sec.96"},
-    ...
-  ],
-  "context_chunks": [
-    "Section 96 of the Act provides that...",
-    "The general process in New South Wales is..."
-  ]
+  "answer": "Step 1 - Thought: ...\nStep 2 - Action: ...\nFinal Conclusion: ...",
+  "sources": ["Succession Act 2006 (NSW) s 96", "Practical Law ..."],
+  "chunk_metadata": [{"citation": "Succession Act 2006 (NSW) s 96", "url": "https://..."}],
+  "context_chunks": ["Section 96 of the Act provides that...", "..."]
 }
 ```
 
-**Notes:**
-- Each CoT step is prefixed as "Step X - [Label]:" for consistent downstream parsing/display.
-- Sources/citations and context are matched to each reasoning step for legal traceability.
-- Error handling will yield string "answer" fields with diagnostics on failure.
-
----
-
-## Application Workflow
-
-- **Ingestion**: Document upload and indexing for efficient search and legal analytics.
-- **Search (BM25, Vector, Hybrid)**: Choice of retrieval for flexibility and accuracy.
-- **Agentic Chat/CoT**: Every question yields a detailed, structured reasoning path, backed by cited context.
-- **GenAI & Oracle DBs**: Integrated, no-fuss access and configuration from the UI tabs.
+Notes:
+- Each CoT step is prefixed as "Step X - [Label]:" to enable reliable parsing and UI rendering.
+- Sources/citations and context are aligned to reasoning steps for legal traceability.
 
 ---
 
 ## Security and Operations
 
-- Always secure endpoints behind WAF, firewall, or proxy.
-- Store all credentials OUTSIDE your repo, in environment or secret managers.
-- Use Let's Encrypt for TLS by default.
-- Rotating secrets and policy compliance is essential for enterprise rollout.
+- Always secure endpoints behind WAF/proxy and TLS.
+- Store credentials outside the repo.
+- Rotate secrets; follow enterprise policy and auditing standards.
 
 ---
 
 ## Contribution and Support
 
 Raise issues, feature requests, or PRs at:  
-[https://github.com/shadabshaukat/auslegalsearchv3](https://github.com/shadabshaukat/auslegalsearchv3)
+https://github.com/shadabshaukat/auslegalsearchv3
 
 ---
 
