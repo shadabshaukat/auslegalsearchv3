@@ -502,6 +502,15 @@ Bench script coverage and session tuning
   - FTS latency
   - Metadata-only filters latency
   - Multi-run p50/p95 summary, hybrid combine
+  - Optimized scenarios aligned with optimized_sql.sql:
+    * cases_by_citation (exact citation match across md_citation/md_citations[])
+    * cases_by_name_trgm (approx case/party name via trigram on md_title_lc)
+    * cases_by_name_lev (Levenshtein refinement/alternative)
+    * legislation_title_trgm (approx legislation title)
+    * types_title_trgm (title search over specified types, e.g., treaty,journal)
+    * ann_with_filters_doc_group (ANN with metadata filters + doc-level grouping)
+    * title_search_doc_group (approx title search with doc-level grouping)
+    * source_approx (approx documents.source)
 - Supported filters include:
   type, jurisdiction, subjurisdiction, database, year, date_from/date_to,
   title_eq, author_eq, citation (single),
