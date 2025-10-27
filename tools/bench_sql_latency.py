@@ -578,7 +578,6 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
     """
     t0 = _now_ms()
     sql = """
-    WITH params AS (SELECT :citations::text[] AS citations)
     SELECT
       d.id AS doc_id,
       d.source AS url,
@@ -596,14 +595,13 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
       ) AS case_name
     FROM embeddings e
     JOIN documents d ON d.id = e.doc_id
-    CROSS JOIN params p
     WHERE e.md_type = 'case'
       AND (
-        (e.md_citation IS NOT NULL AND lower(e.md_citation) = ANY(p.citations))
+        (e.md_citation IS NOT NULL AND lower(e.md_citation) = ANY(:citations))
         OR EXISTS (
           SELECT 1
           FROM jsonb_array_elements_text(COALESCE(e.md_citations, '[]'::jsonb)) AS c(val)
-          WHERE lower(c.val) = ANY(p.citations)
+          WHERE lower(c.val) = ANY(:citations)
         )
       )
     GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database, e.md_citation
@@ -751,7 +749,6 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
     t0 = _now_ms()
     _set_trgm_limit(conn, trgm_limit)
     sql = """
-    WITH params AS (SELECT LOWER(:q::text) AS q, :types::text[] AS types, :lim::int AS lim)
     SELECT
       d.id AS doc_id,
       d.source AS url,
@@ -759,15 +756,14 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
       e.md_title AS title,
       e.md_author AS author,
       e.md_date AS date,
-      similarity(e.md_title_lc, p.q) AS score
+      similarity(e.md_title_lc, LOWER(:q::text)) AS score
     FROM embeddings e
     JOIN documents d ON d.id = e.doc_id
-    CROSS JOIN params p
-    WHERE e.md_type = ANY(p.types)
-      AND (e.md_title_lc % p.q)
+    WHERE e.md_type = ANY(:types)
+      AND (e.md_title_lc % LOWER(:q::text))
     GROUP BY d.id, d.source, e.md_type, e.md_title, e.md_author, e.md_date
     ORDER BY score DESC, e.md_date DESC
-    LIMIT (SELECT lim FROM params)
+    LIMIT :lim
     """
     rows = conn.execute(text(sql), {"q": title, "types": types, "lim": int(limit)}).fetchall()
     hits = []
