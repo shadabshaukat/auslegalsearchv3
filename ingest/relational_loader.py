@@ -217,8 +217,6 @@ def ensure_legislation(session, url: Optional[str], jurisdiction: Optional[str],
                       enacted_date=enacted_date_iso, year=year, name=name, database=database)
     session.add(obj); session.commit(); session.refresh(obj)
     return obj
-    session.add(obj); session.commit(); session.refresh(obj)
-    return obj
 
 def add_legislation_sections_from_dashed(session, legislation_id: int, doc_text: str) -> int:
     """
