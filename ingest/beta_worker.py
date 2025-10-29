@@ -109,6 +109,14 @@ def read_partition_file(fname: str) -> List[str]:
         lines = [ln.strip() for ln in f if ln.strip()]
     return lines
 
+def _sort_by_size_desc(paths: List[str]) -> List[str]:
+    def _sz(p: str) -> int:
+        try:
+            return int(os.path.getsize(p))
+        except Exception:
+            return 0
+    return sorted(paths, key=_sz, reverse=True)
+
 
 def derive_path_metadata(file_path: str, root_dir: str) -> Dict[str, Any]:
     """
@@ -743,6 +751,13 @@ def run_worker_pipelined(
         if not root_dir:
             raise ValueError("Either --partition_file or --root must be provided")
         files = find_all_supported_files(root_dir)
+    # Optional: sort this worker's files by size desc to reduce tail latency (env-enabled by default)
+    if os.environ.get("AUSLEGALSEARCH_SORT_WORKER_FILES", "1") != "0":
+        try:
+            files = _sort_by_size_desc(files)
+            print(f"[beta_worker] {session_name}: sorted {len(files)} files by size desc for better GPU utilization", flush=True)
+        except Exception as e:
+            print(f"[beta_worker] {session_name}: note: could not sort by size: {e}", flush=True)
 
     # Defer CUDA model initialization until AFTER the worker pool is created to avoid CUDA context fork
     embedder = None  # type: ignore
@@ -1006,6 +1021,13 @@ def run_worker(
         if not root_dir:
             raise ValueError("Either --partition_file or --root must be provided")
         files = find_all_supported_files(root_dir)
+    # Optional: sort this worker's files by size desc to reduce tail latency (env-enabled by default)
+    if os.environ.get("AUSLEGALSEARCH_SORT_WORKER_FILES", "1") != "0":
+        try:
+            files = _sort_by_size_desc(files)
+            print(f"[beta_worker] {session_name}: sorted {len(files)} files by size desc for better GPU utilization", flush=True)
+        except Exception as e:
+            print(f"[beta_worker] {session_name}: note: could not sort by size: {e}", flush=True)
 
     embedder = Embedder(embedding_model) if embedding_model else Embedder()
     cfg = ChunkingConfig(

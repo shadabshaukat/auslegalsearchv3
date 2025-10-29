@@ -228,6 +228,21 @@ python3 -m ingest.beta_orchestrator \
   --log_dir "/abs/path/to/logs"
 ```
 
+Dynamic sharding and size balancing (reduces tail latency on skewed corpora)
+```sh
+python3 -m ingest.beta_orchestrator \
+  --root "/path/to/Data_for_Beta_Launch" \
+  --session "beta-sharded-$(date +%Y%m%d-%H%M%S)" \
+  --gpus 4 --shards 16 --balance_by_size \
+  --model "nomic-ai/nomic-embed-text-v1.5" \
+  --target_tokens 1500 --overlap_tokens 192 --max_tokens 1920 \
+  --log_dir "/abs/path/to/logs"
+```
+Notes:
+- --shards splits the file list into many shards (default GPUs*4) and dynamically schedules them across GPUs to reduce stragglers.
+- --balance_by_size greedily balances shards by total file size; orchestration auto-enables this when size skew is high.
+- Per-worker file ordering by size is enabled by env: AUSLEGALSEARCH_SORT_WORKER_FILES=1 (default). Set 0 to keep natural order.
+
 Resume a stuck child on “remaining files” only
 ```sh
 session=beta-full-YYYYMMDD-HHMMSS

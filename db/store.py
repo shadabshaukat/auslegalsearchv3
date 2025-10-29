@@ -198,7 +198,11 @@ def create_all_tables():
             except Exception as e:
                 print(f"[EXT NOTE] Could not enable extension: {ddl}\nReason: {e}")
 
-    Base.metadata.create_all(engine)
+    Base.metadata.create_all(engine, tables=[
+        User.__table__, Document.__table__, Embedding.__table__,
+        EmbeddingSession.__table__, EmbeddingSessionFile.__table__,
+        ChatSession.__table__, ConversionFile.__table__
+    ])
     # --- Post-table DDL: create indexes, triggers, and FTS structures if missing ---
     # Light-init mode skips heavy backfills and large index builds to avoid stalls on new instances.
     # Set AUSLEGALSEARCH_SCHEMA_LIGHT_INIT=1 in the environment to enable.
@@ -209,52 +213,6 @@ def create_all_tables():
         """
         ALTER TABLE public.documents
         ADD COLUMN IF NOT EXISTS document_fts tsvector
-        """,
-        # Add subjurisdiction to normalized tables if missing
-        """
-        ALTER TABLE public.cases
-        ADD COLUMN IF NOT EXISTS subjurisdiction VARCHAR(32)
-        """,
-        """
-        ALTER TABLE public.legislation
-        ADD COLUMN IF NOT EXISTS subjurisdiction VARCHAR(32)
-        """,
-        # Widen columns to TEXT to avoid truncation (names/titles/citations can be long)
-        """
-        ALTER TABLE public.case_names
-        ALTER COLUMN name TYPE text
-        """,
-        """
-        ALTER TABLE public.case_citation_refs
-        ALTER COLUMN citation TYPE text
-        """,
-        """
-        ALTER TABLE public.legislation
-        ALTER COLUMN name TYPE text
-        """,
-        """
-        ALTER TABLE public.legislation_sections
-        ALTER COLUMN title TYPE text
-        """,
-        """
-        ALTER TABLE public.journals
-        ALTER COLUMN title TYPE text
-        """,
-        """
-        ALTER TABLE public.journal_authors
-        ALTER COLUMN name TYPE text
-        """,
-        """
-        ALTER TABLE public.journal_citation_refs
-        ALTER COLUMN citation TYPE text
-        """,
-        """
-        ALTER TABLE public.treaties
-        ALTER COLUMN title TYPE text
-        """,
-        """
-        ALTER TABLE public.treaty_citation_refs
-        ALTER COLUMN citation TYPE text
         """,
     ]
 
@@ -319,55 +277,6 @@ def create_all_tables():
         """
         CREATE INDEX IF NOT EXISTS idx_esf_status
         ON public.embedding_session_files (status)
-        """,
-
-        # Relational model hardening: unique and partial unique indexes to enforce PK/FK usage safely
-        # Avoid duplicate child rows under concurrency; keep loader idempotent at DB-level
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_case_names_case_name
-        ON public.case_names (case_id, name)
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_case_citation_refs_case_cit
-        ON public.case_citation_refs (case_id, citation)
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_journal_authors_journal_name
-        ON public.journal_authors (journal_id, name)
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_journal_citation_refs_journal_cit
-        ON public.journal_citation_refs (journal_id, citation)
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_treaty_countries_treaty_country
-        ON public.treaty_countries (treaty_id, country)
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_treaty_citation_refs_treaty_cit
-        ON public.treaty_citation_refs (treaty_id, citation)
-        """,
-        # Legislation sections: composite uniqueness (nulls are distinct; acceptable for our data)
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_legislation_sections_comp
-        ON public.legislation_sections (legislation_id, identifier, title)
-        """,
-        # Partial unique on URL when present to prevent duplicate master rows (optional safety)
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_cases_url_notnull
-        ON public.cases (url) WHERE url IS NOT NULL
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_legislation_url_notnull
-        ON public.legislation (url) WHERE url IS NOT NULL
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_journals_url_notnull
-        ON public.journals (url) WHERE url IS NOT NULL
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_treaties_url_notnull
-        ON public.treaties (url) WHERE url IS NOT NULL
         """,
     ])
     # Force psql to continue on error for objects already existing

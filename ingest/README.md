@@ -16,7 +16,7 @@ Key modules
 
 ## Capabilities
 
-- Multi-GPU orchestration (one worker per GPU; auto-detect via nvidia-smi; optional explicit GPU count)
+- Multi-GPU orchestration with dynamic sharding and scheduling across GPUs (auto-detect via nvidia-smi; optional explicit GPU count); size-aware shard formation and per-worker size-desc processing reduce tail latency on skewed corpora
 - Per-file pipeline:
   1) Parse (.txt/.html) -> base text + file-level metadata
   2) Chunk (semantic token-aware; dashed-header aware; optional RCTS fallback)
@@ -51,7 +51,7 @@ Key modules
 - Discovers files:
   - Full ingest: ingest.beta_worker.find_all_supported_files(root)
   - Sample mode: ingest/beta_scanner.py find_sample_files(root, skip_year_dirs=True) — one file per folder; prunes year directories
-- Partitions files across GPUs (equal count or greedy by total size)
+- Partitions into shards (default GPUs*4) and dynamically schedules them across GPUs; shards balanced by equal count or greedy by total size (auto-enabled on skew)
 - Ensures DB schema (create_all_tables)
 - Creates child sessions: {session}-gpu0, -gpu1, ...
 - Launches one worker per child (sets CUDA_VISIBLE_DEVICES=idx). Writes partition files:
@@ -120,6 +120,7 @@ Worker timeouts & pipeline
 - AUSLEGALSEARCH_TIMEOUT_SELECT (30)
 - AUSLEGALSEARCH_CPU_WORKERS (default min(8, cores-1))
 - AUSLEGALSEARCH_PIPELINE_PREFETCH (default 64)
+- AUSLEGALSEARCH_SORT_WORKER_FILES (default 1: process this worker’s files in descending size order to reduce tail latency)
 
 Chunking switches
 - AUSLEGALSEARCH_USE_RCTS_GENERIC=1 (optional LangChain fallback)
@@ -283,6 +284,28 @@ LIMIT 20;
 ```
 
 
+## Dynamic sharding and size balancing
+
+On skewed corpora (a few very large files mixed with many small files), static partitions cause stragglers. The orchestrator now supports:
+- Sharding: split the file list into many shards (default GPUs*4) and dynamically schedule shards across GPUs (work-stealing).
+- Size-aware shard formation: greedy bin-packing by total file size; auto-enabled when size skew is high.
+- Per-worker size-desc ordering: each worker processes assigned files largest-first to reduce tail latency.
+
+Example:
+```bash
+python3 -m ingest.beta_orchestrator \
+  --root "/path/to/Data_for_Beta_Launch" \
+  --session "beta-sharded-$(date +%Y%m%d-%H%M%S)" \
+  --gpus 4 --shards 16 --balance_by_size \
+  --model "nomic-ai/nomic-embed-text-v1.5" \
+  --target_tokens 1500 --overlap_tokens 192 --max_tokens 1920 \
+  --log_dir "/abs/path/to/logs"
+```
+Notes:
+- --shards: number of shards (0=auto GPUs*4). More shards improve load balancing at the cost of more processes.
+- --balance_by_size: greedy size-based shard formation; automatically enabled when size skew (Gini) is high.
+- Env AUSLEGALSEARCH_SORT_WORKER_FILES=1 sorts per-worker files by size desc. Set 0 to keep natural order.
+
 ## CLI reference
 
 Orchestrator (ingest/beta_orchestrator.py)
@@ -295,6 +318,7 @@ Orchestrator (ingest/beta_orchestrator.py)
 - --log_dir
 - --no_wait (do not aggregate; exit after launch)
 - --balance_by_size (greedy size-balanced partitions across GPUs)
+- --shards (number of shards; 0=auto GPUs*4; enables dynamic scheduling across GPUs)
 
 Worker (ingest/beta_worker.py)
 - Positional: session_name (e.g., beta-...-gpu0)

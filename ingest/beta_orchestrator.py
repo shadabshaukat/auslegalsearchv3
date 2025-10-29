@@ -119,6 +119,33 @@ def partition_by_size(items: List[str], n: int) -> List[List[str]]:
         # fallback to simple partition on any unexpected error
         return partition(items, n)
 
+def _gini_coefficient(values: List[int]) -> float:
+    """
+    Compute Gini coefficient for non-negative values list.
+    0 = perfect equality, 1 = maximal inequality.
+    """
+    vals = [v for v in values if v >= 0]
+    if not vals:
+        return 0.0
+    vals.sort()
+    n = len(vals)
+    cum = 0
+    for i, v in enumerate(vals, start=1):
+        cum += i * v
+    total = sum(vals)
+    if total == 0:
+        return 0.0
+    return (2 * cum) / (n * total) - (n + 1) / n
+
+def _file_sizes(paths: List[str]) -> List[int]:
+    out = []
+    for p in paths:
+        try:
+            out.append(int(os.path.getsize(p)))
+        except Exception:
+            out.append(0)
+    return out
+
 
 def write_partition_file(part: List[str], fname: str) -> None:
     with open(fname, "w") as f:
@@ -200,6 +227,7 @@ def orchestrate(
     overlap_tokens: int,
     max_tokens: int,
     log_dir: str,
+    shards: int = 0,
     balance_by_size: bool = False,
     wait: bool = True
 ) -> Dict[str, Any]:
@@ -258,27 +286,42 @@ def orchestrate(
         num = max(1, min(num_gpus, detected))
     print(f"[beta_orchestrator] GPUs detected={detected}, using={num}, parent CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}", flush=True)
 
+    # Decide shard count (more shards than GPUs enables dynamic scheduling to reduce tail latency)
+    shards_count = int(shards) if shards and shards > 0 else max(num * 4, num)
+    shards_count = min(shards_count, max(1, len(files)))  # cap to file count
+    # Auto-enable size balancing if file size distribution is skewed
+    if not balance_by_size:
+        sizes = _file_sizes(files)
+        gini = _gini_coefficient(sizes)
+        if gini >= 0.6 and num > 1:
+            balance_by_size = True
+            print(f"[beta_orchestrator] Detected skewed size distribution (gini={gini:.2f}); enabling size-balanced partitioning.", flush=True)
+
+    # Partition into shards
     if balance_by_size:
-        print(f"[beta_orchestrator] Partitioning by total file size across {num} GPU(s)...", flush=True)
-        parts = partition_by_size(files, num)
+        print(f"[beta_orchestrator] Partitioning by total size into {shards_count} shard(s) over {num} GPU(s)...", flush=True)
+        parts = partition_by_size(files, shards_count)
     else:
-        parts = partition(files, num)
+        print(f"[beta_orchestrator] Partitioning evenly into {shards_count} shard(s) over {num} GPU(s)...", flush=True)
+        parts = partition(files, shards_count)
     if not parts:
         parts = [files]
 
-    # Prepare workers
-    procs: List[subprocess.Popen] = []
+    # Dynamic scheduling: launch up to 'num' workers; when one finishes, schedule next shard on same GPU
     child_sessions: List[str] = []
     part_files: List[str] = []
+    procs: List[subprocess.Popen] = []
+    active: List[Dict[str, Any]] = []  # [{proc, gpu, child}]
+    next_idx = 0
 
-    for i, file_part in enumerate(parts):
-        child = f"{session_name}-gpu{i}"
+    def _launch_shard(gpu_index: int, shard_idx: int) -> None:
+        nonlocal child_sessions, part_files, procs, active
+        file_part = parts[shard_idx]
+        child = f"{session_name}-gpu{gpu_index}-shard{shard_idx}"
         pfile = f".beta-gpu-partition-{child}.txt"
         write_partition_file(file_part, pfile)
         print(f"[beta_orchestrator] child={child}, files={len(file_part)}, partition={pfile}", flush=True)
-        # Record child session in DB for UI/progress
         start_session(session_name=child, directory=os.path.abspath(root_dir), total_files=len(file_part), total_chunks=None)
-        # Launch worker
         proc = launch_worker(
             child_session=child,
             root_dir=os.path.abspath(root_dir),
@@ -288,11 +331,38 @@ def orchestrate(
             overlap_tokens=overlap_tokens,
             max_tokens=max_tokens,
             log_dir=str(log_root),
-            gpu_index=i if num > 1 else None
+            gpu_index=gpu_index if num > 1 else None
         )
-        procs.append(proc)
         child_sessions.append(child)
         part_files.append(pfile)
+        procs.append(proc)
+        active.append({"proc": proc, "gpu": gpu_index, "child": child})
+
+    # Seed initial workers
+    for gpu_i in range(min(num, len(parts))):
+        _launch_shard(gpu_i, next_idx)
+        next_idx += 1
+
+    # Wait and schedule remaining shards
+    exit_codes: List[int] = []
+    while active:
+        # poll active processes
+        still_active = []
+        for item in active:
+            proc = item["proc"]
+            gpu_i = item["gpu"]
+            if proc.poll() is None:
+                still_active.append(item)
+                continue
+            # finished
+            exit_codes.append(proc.returncode if hasattr(proc, "returncode") else 0)
+            # schedule next shard on this GPU if any left
+            if next_idx < len(parts):
+                _launch_shard(gpu_i, next_idx)
+                next_idx += 1
+        active = still_active
+        if active:
+            time.sleep(0.5)
 
     summary = {
         "root": os.path.abspath(root_dir),
@@ -300,7 +370,8 @@ def orchestrate(
         "child_sessions": child_sessions,
         "partition_files": part_files,
         "total_files": total_files,
-        "gpus_used": len(parts),
+        "gpus_used": num,
+        "shards": len(parts),
         "detected_gpus": detected,
         "log_dir": str(log_root),
     }
@@ -399,6 +470,7 @@ def _parse_cli_args(argv: List[str]) -> Dict[str, Any]:
     ap.add_argument("--log_dir", default="./logs", help="Directory to write per-worker and aggregated success/error logs")
     ap.add_argument("--no_wait", action="store_true", help="Do not wait for workers; exit after launch (no aggregation)")
     ap.add_argument("--balance_by_size", action="store_true", help="Greedy size-balanced partitions across GPUs (better load balance)")
+    ap.add_argument("--shards", type=int, default=0, help="Number of shards to split the file list into (0=auto: GPUs*4). Enables dynamic scheduling across GPUs.")
     return vars(ap.parse_args(argv))
 
 
@@ -415,6 +487,7 @@ if __name__ == "__main__":
         overlap_tokens=args.get("overlap_tokens") or 64,
         max_tokens=args.get("max_tokens") or 640,
         log_dir=args.get("log_dir") or "./logs",
+        shards=args.get("shards") or 0,
         balance_by_size=bool(args.get("balance_by_size")),
         wait=not bool(args.get("no_wait")),
     )
