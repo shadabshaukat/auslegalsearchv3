@@ -306,6 +306,15 @@ Notes:
 - --balance_by_size: greedy size-based shard formation; automatically enabled when size skew (Gini) is high.
 - Env AUSLEGALSEARCH_SORT_WORKER_FILES=1 sorts per-worker files by size desc. Set 0 to keep natural order.
 
+### Partition validation and manifest
+
+To ensure complete and unique coverage of files across shards, the orchestrator validates partitions before launching workers:
+- If any file is duplicated across shards or any source file is missing from all shards, the run aborts with a RuntimeError.
+- Diagnostics are written to:
+  - {log_dir}/{session}.partition.validation.json — includes counts, list of duplicates, and a sample of missing files
+  - {log_dir}/{session}.partition.manifest.json — always written; lists total files, per-shard file counts, and uniqueness counts
+- This guarantees every source file is assigned to exactly one shard.
+
 ## CLI reference
 
 Orchestrator (ingest/beta_orchestrator.py)

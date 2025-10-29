@@ -307,6 +307,42 @@ def orchestrate(
     if not parts:
         parts = [files]
 
+    # Coverage validation: ensure each file appears exactly once across shards
+    flat = [p for sub in parts for p in sub]
+    unique = set(flat)
+    if len(flat) != len(files) or len(unique) != len(files):
+        # Compute diagnostics
+        extra = [p for p in flat if flat.count(p) > 1]
+        missing = [p for p in files if p not in unique]
+        manifest = {
+            "total_files": len(files),
+            "assigned_total": len(flat),
+            "unique_assigned": len(unique),
+            "duplicates": sorted(list(dict.fromkeys(extra))),
+            "missing_sample": missing[:100],
+        }
+        man_path = Path(log_root) / f"{session_name}.partition.validation.json"
+        try:
+            with man_path.open("w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        except Exception:
+            pass
+        raise RuntimeError(f"Partition coverage validation failed. See {man_path} for details.")
+    # Write manifest for auditing
+    try:
+        manifest = {
+            "total_files": len(files),
+            "shards": [{"index": i, "count": len(p)} for i, p in enumerate(parts)],
+            "assigned_total": sum(len(p) for p in parts),
+            "unique_assigned": len(unique),
+        }
+        man_path = Path(log_root) / f"{session_name}.partition.manifest.json"
+        with man_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[beta_orchestrator] Partition manifest written: {man_path}", flush=True)
+    except Exception as e:
+        print(f"[beta_orchestrator] Could not write partition manifest: {e}", flush=True)
+
     # Dynamic scheduling: launch up to 'num' workers; when one finishes, schedule next shard on same GPU
     child_sessions: List[str] = []
     part_files: List[str] = []
