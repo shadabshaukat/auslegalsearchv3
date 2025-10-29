@@ -38,6 +38,29 @@ DEFAULT_TARGET_TOKENS = 512
 DEFAULT_OVERLAP_TOKENS = 64
 DEFAULT_MAX_TOKENS = 640  # safety upper bound
 
+# Document-level metadata keys that must NOT be overwritten by section-level header meta.
+# We keep these from the file frontmatter (base_meta) and map header 'title' into section_title instead.
+PROTECTED_DOC_KEYS = {
+    "title",
+    "year",
+    "date",
+    "type",
+    "jurisdiction",
+    "subjurisdiction",
+    "database",
+    "url",
+    "ext",
+    "filename",
+    "rel_path",
+    "rel_path_no_years",
+    "path_parts",
+    "path_parts_no_years",
+    "dataset_root",
+    "court_guess",
+    "jurisdiction_guess",
+    "series_guess",
+}
+
 
 # ---- Tokenization and basic text utilities ----
 
@@ -538,10 +561,15 @@ def chunk_legislation_dashed_semantic(
         chs = chunk_text_semantic(body, cfg, section_title=section_title, section_idx=sec_idx)
         for bc in chs:
             md = dict(base_meta or {})
-            # carry over section-level metadata derived from dashed header
-            md.update(header_meta)
+            # carry over section-level metadata derived from dashed header,
+            # but DO NOT overwrite document-level keys (e.g., 'title', 'year', etc.)
+            safe_header = {k: v for k, v in (header_meta or {}).items() if k not in PROTECTED_DOC_KEYS and k != "title"}
+            md.update(safe_header)
             # also merge per-chunk metadata (tokens_est, chunk_idx, section_title/idx)
             cm = dict(bc.get("chunk_metadata") or {})
+            # Ensure section_title is present from header 'title' if not already set
+            if not cm.get("section_title") and (header_meta.get("title")):
+                cm["section_title"] = header_meta.get("title")
             md.update(cm)
             out.append({
                 "text": bc["text"],
@@ -652,7 +680,9 @@ def chunk_generic_rcts(
             continue
         md = dict(base_meta or {})
         if header_meta:
-            md.update(header_meta)
+            # do not clobber document-level keys; map header 'title' into section context only
+            safe_header = {k: v for k, v in (header_meta or {}).items() if k not in PROTECTED_DOC_KEYS and k != "title"}
+            md.update(safe_header)
         md.update({
             "section_title": sec_title,
             "section_idx": 0,

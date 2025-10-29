@@ -5,7 +5,7 @@ Centralized DB models and ORM for auslegalsearchv3.
 """
 
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean, Float
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean, Float, Date
 from sqlalchemy import select, desc, text
 from db.connector import engine, SessionLocal, Vector, JSONB, UUIDType
 from datetime import datetime
@@ -90,6 +90,99 @@ class ConversionFile(Base):
     success = Column(Boolean, nullable=True, default=None)
     error_message = Column(Text, nullable=True)
 
+# --- Relational tables for normalized legal metadata ---
+
+class Case(Base):
+    __tablename__ = "cases"
+    case_id = Column(Integer, primary_key=True)
+    url = Column(String(1024), nullable=True)
+    jurisdiction = Column(String(32), nullable=True)
+    subjurisdiction = Column(String(32), nullable=True)
+    case_date = Column(Date, nullable=True)
+    court = Column(String(128), nullable=True)
+
+class CaseName(Base):
+    __tablename__ = "case_names"
+    case_name_id = Column(Integer, primary_key=True)
+    case_id = Column(Integer, ForeignKey('cases.case_id'), nullable=False, index=True)
+    name = Column(String(512), nullable=False)
+
+class CaseCitationRef(Base):
+    __tablename__ = "case_citation_refs"
+    citation_ref_id = Column(Integer, primary_key=True)
+    case_id = Column(Integer, ForeignKey('cases.case_id'), nullable=False, index=True)
+    citation = Column(String(128), nullable=False)
+
+class Legislation(Base):
+    __tablename__ = "legislation"
+    legislation_id = Column(Integer, primary_key=True)
+    url = Column(String(1024), nullable=True)
+    jurisdiction = Column(String(32), nullable=True)
+    subjurisdiction = Column(String(32), nullable=True)
+    enacted_date = Column(Date, nullable=True)
+    year = Column(Integer, nullable=True)
+    name = Column(String(1024), nullable=True)
+    database = Column(String(128), nullable=True)
+
+class LegislationSection(Base):
+    __tablename__ = "legislation_sections"
+    section_id = Column(Integer, primary_key=True)
+    legislation_id = Column(Integer, ForeignKey('legislation.legislation_id'), nullable=False, index=True)
+    identifier = Column(String(32), nullable=True)  # e.g., "288", "1.5.1"
+    type = Column(String(32), nullable=True)        # e.g., "regulation", "schedule", "section"
+    title = Column(String(256), nullable=True)
+    content = Column(Text, nullable=False)
+
+# --- Journals (normalized) ---
+
+class Journal(Base):
+    __tablename__ = "journals"
+    journal_id = Column(Integer, primary_key=True)
+    url = Column(String(1024), nullable=True)
+    jurisdiction = Column(String(32), nullable=True)
+    subjurisdiction = Column(String(32), nullable=True)
+    published_date = Column(Date, nullable=True)
+    year = Column(Integer, nullable=True)
+    title = Column(String(1024), nullable=True)
+    database = Column(String(128), nullable=True)
+
+class JournalAuthor(Base):
+    __tablename__ = "journal_authors"
+    journal_author_id = Column(Integer, primary_key=True)
+    journal_id = Column(Integer, ForeignKey('journals.journal_id'), nullable=False, index=True)
+    name = Column(String(512), nullable=False)
+
+class JournalCitationRef(Base):
+    __tablename__ = "journal_citation_refs"
+    citation_ref_id = Column(Integer, primary_key=True)
+    journal_id = Column(Integer, ForeignKey('journals.journal_id'), nullable=False, index=True)
+    citation = Column(String(128), nullable=False)
+
+# --- Treaties (normalized) ---
+
+class Treaty(Base):
+    __tablename__ = "treaties"
+    treaty_id = Column(Integer, primary_key=True)
+    url = Column(String(1024), nullable=True)
+    jurisdiction = Column(String(32), nullable=True)
+    subjurisdiction = Column(String(32), nullable=True)
+    signed_date = Column(Date, nullable=True)
+    year = Column(Integer, nullable=True)
+    title = Column(String(1024), nullable=True)
+    database = Column(String(128), nullable=True)
+
+class TreatyCountry(Base):
+    __tablename__ = "treaty_countries"
+    treaty_country_id = Column(Integer, primary_key=True)
+    treaty_id = Column(Integer, ForeignKey('treaties.treaty_id'), nullable=False, index=True)
+    country = Column(String(128), nullable=False)
+
+class TreatyCitationRef(Base):
+    __tablename__ = "treaty_citation_refs"
+    citation_ref_id = Column(Integer, primary_key=True)
+    treaty_id = Column(Integer, ForeignKey('treaties.treaty_id'), nullable=False, index=True)
+    citation = Column(String(128), nullable=False)
+
 def create_all_tables():
     # Enable vital extensions (in superuser context if allowed)
     exts = [
@@ -116,6 +209,15 @@ def create_all_tables():
         """
         ALTER TABLE public.documents
         ADD COLUMN IF NOT EXISTS document_fts tsvector
+        """,
+        # Add subjurisdiction to normalized tables if missing
+        """
+        ALTER TABLE public.cases
+        ADD COLUMN IF NOT EXISTS subjurisdiction VARCHAR(32)
+        """,
+        """
+        ALTER TABLE public.legislation
+        ADD COLUMN IF NOT EXISTS subjurisdiction VARCHAR(32)
         """,
     ]
 
@@ -570,6 +672,10 @@ def search_fts(query, top_k=10, mode="both"):
 __all__ = [
     "Base", "engine", "SessionLocal", "Vector", "JSONB", "UUIDType",
     "User", "Document", "Embedding", "EmbeddingSession", "EmbeddingSessionFile", "ChatSession", "ConversionFile",
+    # Relational models
+    "Case", "CaseName", "CaseCitationRef", "Legislation", "LegislationSection",
+    "Journal", "JournalAuthor", "JournalCitationRef",
+    "Treaty", "TreatyCountry", "TreatyCitationRef",
     "create_all_tables",
     "hash_password", "check_password",
     "create_user", "get_user_by_email", "set_last_login", "get_user_by_googleid",

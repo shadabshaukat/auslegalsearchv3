@@ -159,33 +159,37 @@ WITH params AS (
   SELECT LOWER($1::text) AS q,
          $2::text AS jurisdiction,
          $3::int  AS year,
-         $4::text AS court
+         $4::text AS court,
+         COALESCE($5::int, 1000) AS shortlist
+),
+seed AS (
+  SELECT
+    e.doc_id,
+    d.source AS url,
+    e.md_jurisdiction AS jurisdiction,
+    e.md_date AS case_date,
+    e.md_database AS court,
+    e.md_title AS case_name,
+    similarity(e.md_title_lc, p.q) AS name_similarity
+  FROM embeddings e
+  JOIN documents d ON d.id = e.doc_id
+  CROSS JOIN params p
+  WHERE e.md_type = 'case'
+    AND (e.md_title_lc % p.q)
+    AND (p.jurisdiction IS NULL OR e.md_jurisdiction = p.jurisdiction)
+    AND (p.year IS NULL OR e.md_year = p.year)
+    AND (p.court IS NULL OR e.md_database = p.court)
+  ORDER BY similarity(e.md_title_lc, p.q) DESC, e.md_date DESC
+  LIMIT (SELECT shortlist FROM params)
+),
+ranked AS (
+  SELECT s.*, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY name_similarity DESC, case_date DESC) AS rn
+  FROM seed s
 )
-SELECT
-  d.id AS doc_id,
-  d.source AS url,
-  e.md_jurisdiction AS jurisdiction,
-  e.md_date AS case_date,
-  e.md_database AS court,
-  (
-    SELECT string_agg(DISTINCT t, '; ')
-    FROM (
-      SELECT e2.md_title AS t
-      FROM embeddings e2
-      WHERE e2.doc_id = e.doc_id AND e2.md_title IS NOT NULL
-    ) s
-  ) AS case_name,
-  MAX(similarity(e.md_title_lc, p.q)) AS name_similarity
-FROM embeddings e
-JOIN documents d ON d.id = e.doc_id
-CROSS JOIN params p
-WHERE e.md_type = 'case'
-  AND (e.md_title_lc % p.q)
-  AND (p.jurisdiction IS NULL OR e.md_jurisdiction = p.jurisdiction)
-  AND (p.year IS NULL OR e.md_year = p.year)
-  AND (p.court IS NULL OR e.md_database = p.court)
-GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database
-ORDER BY name_similarity DESC, e.md_date DESC;
+SELECT doc_id, url, jurisdiction, case_date, court, case_name, name_similarity
+FROM ranked
+WHERE rn = 1
+ORDER BY name_similarity DESC, case_date DESC;
 
 
 -- =====================================================================

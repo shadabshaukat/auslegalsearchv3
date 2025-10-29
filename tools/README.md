@@ -62,6 +62,29 @@ The benchmark uses the shared db.connector engine and the embedding/embedder int
   - --trgm_limit sets trigram similarity threshold (SELECT set_limit(value))
 
 
+## Trigram shortlist optimization (performance)
+
+Recent improvements add a shortlist-first pattern for trigram scenarios to cut latency from multi-seconds to sub-second:
+
+- Use the trigram GIN index to build a top-N shortlist ordered by similarity
+- Dedupe per document on just that shortlist, with ROW_NUMBER()
+- Control candidate pool with:
+  - --trgm_limit (SELECT set_limit(value), e.g., 0.35–0.45)
+  - --shortlist (e.g., 200–1000)
+
+Example (slow case made fast):
+- Original pattern: window over entire embeddings table
+- Fast pattern: shortlist top-N by similarity, then RN=1 per doc
+
+Ensure indexes exist (see “Indexing and tuning notes”):
+
+- GIN (pg_trgm) on md_title_lc
+- Optionally partial GIN for WHERE md_type='case'
+- BTree on md_type
+
+Tune per corpus size and recall requirements.
+
+
 ## Baseline Quickstart
 
 Run a case-law style query with metadata filters and vector probes:
@@ -106,12 +129,12 @@ The following scenarios mirror the optimized SQL templates in schema-post-load/o
 
 - cases_by_name_trgm
   - Trigram approximate match on case/party name (md_title_lc), optional filters.
-  - Supports --trgm_limit to adjust similarity threshold.
+  - Supports --trgm_limit and --shortlist to tune candidate set and latency.
   - Example:
     ```bash
     python3 tools/bench_sql_latency.py --scenario cases_by_name_trgm \
       --name "Angelides v Hendersons" --jurisdiction cth --year 1927 --court HCA \
-      --runs 5 --trgm_limit 0.25
+      --runs 5 --trgm_limit 0.40 --shortlist 500
     ```
 
 - cases_by_name_lev
@@ -134,11 +157,12 @@ The following scenarios mirror the optimized SQL templates in schema-post-load/o
 
 - types_title_trgm
   - Title search for specified types, e.g., treaty and journal.
-  - Comma-separated --types (e.g., "treaty,journal"), supports --trgm_limit.
+  - Comma-separated --types (e.g., "treaty,journal"), supports --trgm_limit and --shortlist.
   - Example:
     ```bash
     python3 tools/bench_sql_latency.py --scenario types_title_trgm \
-      --title "investment agreement" --types "treaty,journal" --limit 20 --runs 5
+      --title "investment agreement" --types "treaty,journal" \
+      --limit 20 --runs 5 --trgm_limit 0.40 --shortlist 1000
     ```
 
 - ann_with_filters_doc_group
@@ -156,11 +180,12 @@ The following scenarios mirror the optimized SQL templates in schema-post-load/o
 
 - title_search_doc_group
   - Approximate title search with doc-level grouping and optional filters.
+  - Supports --trgm_limit and --shortlist to reduce candidate set.
   - Example:
     ```bash
     python3 tools/bench_sql_latency.py --scenario title_search_doc_group \
       --title "Succession Act" --type legislation --jurisdiction nsw --year 2006 \
-      --limit 20 --runs 5
+      --limit 20 --runs 5 --trgm_limit 0.40 --shortlist 1000
     ```
 
 - source_approx
@@ -177,6 +202,7 @@ The following scenarios mirror the optimized SQL templates in schema-post-load/o
 - --scenario baseline|cases_by_citation|cases_by_name_trgm|cases_by_name_lev|legislation_title_trgm|types_title_trgm|ann_with_filters_doc_group|title_search_doc_group|source_approx
 - --query TEXT (baseline vector/hybrid; ann_with_filters_doc_group)
 - --top_k INT, --runs INT, --use_jit, --probes INT, --hnsw_ef INT, --trgm_limit FLOAT
+- --shortlist INT (for trigram scenarios: cases_by_name_trgm, types_title_trgm, title_search_doc_group)
 - Filters: --type, --jurisdiction, --subjurisdiction, --database, --year, --date_from, --date_to, --title_eq, --author_eq, --citation, --title_member, --citation_member, --country
 - Approx filters: --author (approx), --title_approx, --source or --source_approx
 - Optimized parameters:
@@ -205,6 +231,10 @@ For high recall and low p95, build the right indexes and choose the right index 
 - IVFFLAT: lighter/faster builds, control recall via --probes and lists (set at build time)
 - Always apply selective metadata equality/range filters (type, jurisdiction, database, year/date) to shrink candidate sets before vector ORDER BY
 - Use partial indexes per cohort (e.g., md_type) when N is huge
+- Trigram indexes:
+  - CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_embeddings_title_trgm ON embeddings USING GIN (md_title_lc gin_trgm_ops);
+  - Optional partial (cases only): CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_embeddings_title_trgm_case ON embeddings USING GIN (md_title_lc gin_trgm_ops) WHERE md_type='case';
+  - BTree for cohort filters: CREATE INDEX IF NOT EXISTS idx_embeddings_md_type ON embeddings(md_type);
 
 See schema-post-load/README.md and schema-post-load/optimized_sql.sql for:
 - Choosing HNSW vs IVFFLAT at TB-scale, build-time memory (maintenance_work_mem), partial indexes
@@ -235,17 +265,11 @@ See schema-post-load/README.md and schema-post-load/optimized_sql.sql for:
   - For IVFFLAT: increase lists at build time, probes at query time
   - For HNSW: increase hnsw.ef_search
   - Ensure ANALYZE has been run after bulk loads and index builds
+  - For trigram scenarios: increase --trgm_limit (e.g., 0.35–0.45) and reduce/increase --shortlist to balance recall vs latency
 
 - No results for FTS
   - Confirm the documents.document_fts column exists and the trigger is in place (db/store.create_all_tables() sets it up)
   - If document_fts is NULL for existing rows, run the backfill (disabled if AUSLEGALSEARCH_SCHEMA_LIGHT_INIT=1)
-
-
-## Development notes
-
-- The benchmark uses the shared SQLAlchemy engine (db.connector.engine). It respects the .env file in the repo root or current working directory and exported env variables.
-- Embeddings for queries are generated using embedding/embedder.py.
-- The script sets session-local GUCs for ivfflat.probes, hnsw.ef_search, jit, and trigram set_limit as appropriate, without changing global configuration.
 
 
 ## Examples
@@ -254,6 +278,20 @@ Case by citation:
 ```bash
 python3 tools/bench_sql_latency.py --scenario cases_by_citation \
   --citations '["[1927] hca 34","(1927) 4 clr 12"]' --runs 5
+```
+
+Cases by name (shortlist + trigram):
+```bash
+python3 tools/bench_sql_latency.py --scenario cases_by_name_trgm \
+  --name "Leech v R" --jurisdiction cth --runs 3 \
+  --trgm_limit 0.40 --shortlist 500
+```
+
+Types by title (shortlist + trigram):
+```bash
+python3 tools/bench_sql_latency.py --scenario types_title_trgm \
+  --title "investment agreement" --types "treaty,journal" \
+  --limit 10 --runs 3 --trgm_limit 0.40 --shortlist 1000
 ```
 
 Legislation by title:

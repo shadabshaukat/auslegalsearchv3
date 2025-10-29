@@ -631,40 +631,47 @@ def run_cases_by_citation(conn: Connection, citations: List[str]) -> Tuple[List[
     return hits, (t1 - t0)
 
 
-def run_cases_by_name_trgm(conn: Connection, name: str, jurisdiction: Optional[str], year: Optional[int], court: Optional[str], trgm_limit: Optional[float]) -> Tuple[List[Dict[str, Any]], float]:
+def run_cases_by_name_trgm(conn: Connection, name: str, jurisdiction: Optional[str], year: Optional[int], court: Optional[str], trgm_limit: Optional[float], shortlist: int) -> Tuple[List[Dict[str, Any]], float]:
     t0 = _now_ms()
     _set_trgm_limit(conn, trgm_limit)
     sql = """
     WITH params AS (
-      SELECT LOWER(:q::text) AS q, :jurisdiction::text AS jurisdiction, :year::int AS year, :court::text AS court
+      SELECT LOWER(:q::text) AS q,
+             :jurisdiction::text AS jurisdiction,
+             :year::int AS year,
+             :court::text AS court,
+             :shortlist::int AS shortlist
+    ),
+    seed AS (
+      SELECT
+        e.doc_id AS doc_id,
+        d.source AS url,
+        e.md_jurisdiction AS jurisdiction,
+        e.md_date AS case_date,
+        e.md_database AS court,
+        e.md_title AS case_name,
+        similarity(e.md_title_lc, p.q) AS name_similarity
+      FROM embeddings e
+      JOIN documents d ON d.id = e.doc_id
+      CROSS JOIN params p
+      WHERE e.md_type = 'case'
+        AND (e.md_title_lc % p.q)
+        AND (p.jurisdiction IS NULL OR e.md_jurisdiction = p.jurisdiction)
+        AND (p.year IS NULL OR e.md_year = p.year)
+        AND (p.court IS NULL OR e.md_database = p.court)
+      ORDER BY similarity(e.md_title_lc, p.q) DESC, e.md_date DESC
+      LIMIT (SELECT shortlist FROM params)
+    ),
+    ranked AS (
+      SELECT s.*, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY name_similarity DESC, case_date DESC) AS rn
+      FROM seed s
     )
-    SELECT
-      d.id AS doc_id,
-      d.source AS url,
-      e.md_jurisdiction AS jurisdiction,
-      e.md_date AS case_date,
-      e.md_database AS court,
-      (
-        SELECT string_agg(DISTINCT t, '; ')
-        FROM (
-          SELECT e2.md_title AS t
-          FROM embeddings e2
-          WHERE e2.doc_id = e.doc_id AND e2.md_title IS NOT NULL
-        ) s
-      ) AS case_name,
-      MAX(similarity(e.md_title_lc, p.q)) AS name_similarity
-    FROM embeddings e
-    JOIN documents d ON d.id = e.doc_id
-    CROSS JOIN params p
-    WHERE e.md_type = 'case'
-      AND (e.md_title_lc % p.q)
-      AND (p.jurisdiction IS NULL OR e.md_jurisdiction = p.jurisdiction)
-      AND (p.year IS NULL OR e.md_year = p.year)
-      AND (p.court IS NULL OR e.md_database = p.court)
-    GROUP BY d.id, d.source, e.md_jurisdiction, e.md_date, e.md_database
-    ORDER BY name_similarity DESC, e.md_date DESC
+    SELECT doc_id, url, jurisdiction, case_date, court, case_name, name_similarity
+    FROM ranked
+    WHERE rn = 1
+    ORDER BY name_similarity DESC, case_date DESC
     """
-    rows = conn.execute(text(sql), {"q": name, "jurisdiction": jurisdiction, "year": year, "court": court}).fetchall()
+    rows = conn.execute(text(sql), {"q": name, "jurisdiction": jurisdiction, "year": year, "court": court, "shortlist": int(shortlist)}).fetchall()
     hits = []
     for r in rows:
         hits.append({
@@ -758,7 +765,7 @@ def run_legislation_title_trgm(conn: Connection, title: str, jurisdiction: Optio
     return hits, (t1 - t0)
 
 
-def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: int, trgm_limit: Optional[float]) -> Tuple[List[Dict[str, Any]], float]:
+def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: int, trgm_limit: Optional[float], shortlist: int) -> Tuple[List[Dict[str, Any]], float]:
     t0 = _now_ms()
     _set_trgm_limit(conn, trgm_limit)
     sql = """
@@ -770,6 +777,8 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
       FROM embeddings e
       WHERE e.md_type = ANY(:types)
         AND (e.md_title_lc % LOWER(:q))
+      ORDER BY score DESC, date DESC
+      LIMIT :shortlist
     ),
     ranked AS (
       SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY score DESC, date DESC) AS rn
@@ -782,7 +791,7 @@ def run_types_title_trgm(conn: Connection, title: str, types: List[str], limit: 
     ORDER BY r.score DESC, r.date DESC
     LIMIT :lim
     """
-    rows = conn.execute(text(sql), {"q": title, "types": types, "lim": int(limit)}).fetchall()
+    rows = conn.execute(text(sql), {"q": title, "types": types, "shortlist": int(shortlist), "lim": int(limit)}).fetchall()
     hits = []
     for r in rows:
         hits.append({
@@ -895,12 +904,18 @@ def run_ann_with_filters_doc_group(
     return hits, (t1 - t0)
 
 
-def run_title_search_doc_group(conn: Connection, title: str, _type: Optional[str], jurisdiction: Optional[str], database: Optional[str], year: Optional[int], limit: int, trgm_limit: Optional[float]) -> Tuple[List[Dict[str, Any]], float]:
+def run_title_search_doc_group(conn: Connection, title: str, _type: Optional[str], jurisdiction: Optional[str], database: Optional[str], year: Optional[int], limit: int, trgm_limit: Optional[float], shortlist: int) -> Tuple[List[Dict[str, Any]], float]:
     t0 = _now_ms()
     _set_trgm_limit(conn, trgm_limit)
     sql = """
     WITH params AS (
-      SELECT LOWER(:q::text) AS q, :type::text AS type, :jurisdiction::text AS jurisdiction, :database::text AS database, :year::int AS year, :lim::int AS lim
+      SELECT LOWER(:q::text) AS q,
+             :type::text AS type,
+             :jurisdiction::text AS jurisdiction,
+             :database::text AS database,
+             :year::int AS year,
+             :lim::int AS lim,
+             :shortlist::int AS shortlist
     ),
     scored AS (
       SELECT
@@ -915,6 +930,8 @@ def run_title_search_doc_group(conn: Connection, title: str, _type: Optional[str
         AND (p.database IS NULL OR e.md_database = p.database)
         AND (p.year IS NULL OR e.md_year = p.year)
         AND e.md_title_lc % p.q
+      ORDER BY similarity(e.md_title_lc, p.q) DESC, e.md_date DESC
+      LIMIT (SELECT shortlist FROM params)
     ),
     ranked AS (
       SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY score DESC) AS rn
@@ -926,7 +943,7 @@ def run_title_search_doc_group(conn: Connection, title: str, _type: Optional[str
     ORDER BY score DESC, md_date DESC
     LIMIT (SELECT lim FROM params)
     """
-    rows = conn.execute(text(sql), {"q": title, "type": _type, "jurisdiction": jurisdiction, "database": database, "year": year, "lim": int(limit)}).fetchall()
+    rows = conn.execute(text(sql), {"q": title, "type": _type, "jurisdiction": jurisdiction, "database": database, "year": year, "lim": int(limit), "shortlist": int(shortlist)}).fetchall()
     hits = []
     for r in rows:
         hits.append({
@@ -1013,6 +1030,7 @@ def main():
     ap.add_argument("--title", default=None, help="Title string for legislation_title_trgm/types_title_trgm/title_search_doc_group")
     ap.add_argument("--types", default=None, help="Comma-separated list for types_title_trgm, e.g., 'treaty,journal'")
     ap.add_argument("--limit", type=int, default=20, help="Limit for some optimized scenarios")
+    ap.add_argument("--shortlist", type=int, default=1000, help="Shortlist size for trigram scenarios before doc-level ranking")
 
     # Extra approx filters for ANN doc group scenario
     ap.add_argument("--author", default=None, help="Approximate author for ann_with_filters_doc_group/title_search_doc_group (baseline also uses it)")
@@ -1140,7 +1158,7 @@ def main():
             if not args.name:
                 raise SystemExit("--name is required")
             for _ in range(max(1, args.runs)):
-                hits, ms = run_cases_by_name_trgm(conn, args.name, args.jurisdiction, args.year, args.database, args.trgm_limit)
+                hits, ms = run_cases_by_name_trgm(conn, args.name, args.jurisdiction, args.year, args.database, args.trgm_limit, args.shortlist)
                 times.append(ms); last_hits = hits
             print("\n--- Latency Summary (ms) ---")
             print(_summary_line("cases_by_name_trgm", times))
@@ -1180,7 +1198,7 @@ def main():
                 raise SystemExit("--title and --types are required")
             types = [t.strip() for t in args.types.split(",") if t.strip()]
             for _ in range(max(1, args.runs)):
-                hits, ms = run_types_title_trgm(conn, args.title, types, args.limit, args.trgm_limit)
+                hits, ms = run_types_title_trgm(conn, args.title, types, args.limit, args.trgm_limit, args.shortlist)
                 times.append(ms); last_hits = hits
             print("\n--- Latency Summary (ms) ---")
             print(_summary_line("types_title_trgm", times))
@@ -1225,7 +1243,7 @@ def main():
             if not args.title:
                 raise SystemExit("--title is required")
             for _ in range(max(1, args.runs)):
-                hits, ms = run_title_search_doc_group(conn, args.title, args.type_, args.jurisdiction, args.database, args.year, args.limit, args.trgm_limit)
+                hits, ms = run_title_search_doc_group(conn, args.title, args.type_, args.jurisdiction, args.database, args.year, args.limit, args.trgm_limit, args.shortlist)
                 times.append(ms); last_hits = hits
             print("\n--- Latency Summary (ms) ---")
             print(_summary_line("title_search_doc_group", times))
