@@ -105,13 +105,13 @@ class CaseName(Base):
     __tablename__ = "case_names"
     case_name_id = Column(Integer, primary_key=True)
     case_id = Column(Integer, ForeignKey('cases.case_id'), nullable=False, index=True)
-    name = Column(String(512), nullable=False)
+    name = Column(Text, nullable=False)
 
 class CaseCitationRef(Base):
     __tablename__ = "case_citation_refs"
     citation_ref_id = Column(Integer, primary_key=True)
     case_id = Column(Integer, ForeignKey('cases.case_id'), nullable=False, index=True)
-    citation = Column(String(128), nullable=False)
+    citation = Column(Text, nullable=False)
 
 class Legislation(Base):
     __tablename__ = "legislation"
@@ -121,7 +121,7 @@ class Legislation(Base):
     subjurisdiction = Column(String(32), nullable=True)
     enacted_date = Column(Date, nullable=True)
     year = Column(Integer, nullable=True)
-    name = Column(String(1024), nullable=True)
+    name = Column(Text, nullable=True)
     database = Column(String(128), nullable=True)
 
 class LegislationSection(Base):
@@ -130,7 +130,7 @@ class LegislationSection(Base):
     legislation_id = Column(Integer, ForeignKey('legislation.legislation_id'), nullable=False, index=True)
     identifier = Column(String(32), nullable=True)  # e.g., "288", "1.5.1"
     type = Column(String(32), nullable=True)        # e.g., "regulation", "schedule", "section"
-    title = Column(String(256), nullable=True)
+    title = Column(Text, nullable=True)
     content = Column(Text, nullable=False)
 
 # --- Journals (normalized) ---
@@ -143,20 +143,20 @@ class Journal(Base):
     subjurisdiction = Column(String(32), nullable=True)
     published_date = Column(Date, nullable=True)
     year = Column(Integer, nullable=True)
-    title = Column(String(1024), nullable=True)
+    title = Column(Text, nullable=True)
     database = Column(String(128), nullable=True)
 
 class JournalAuthor(Base):
     __tablename__ = "journal_authors"
     journal_author_id = Column(Integer, primary_key=True)
     journal_id = Column(Integer, ForeignKey('journals.journal_id'), nullable=False, index=True)
-    name = Column(String(512), nullable=False)
+    name = Column(Text, nullable=False)
 
 class JournalCitationRef(Base):
     __tablename__ = "journal_citation_refs"
     citation_ref_id = Column(Integer, primary_key=True)
     journal_id = Column(Integer, ForeignKey('journals.journal_id'), nullable=False, index=True)
-    citation = Column(String(128), nullable=False)
+    citation = Column(Text, nullable=False)
 
 # --- Treaties (normalized) ---
 
@@ -168,7 +168,7 @@ class Treaty(Base):
     subjurisdiction = Column(String(32), nullable=True)
     signed_date = Column(Date, nullable=True)
     year = Column(Integer, nullable=True)
-    title = Column(String(1024), nullable=True)
+    title = Column(Text, nullable=True)
     database = Column(String(128), nullable=True)
 
 class TreatyCountry(Base):
@@ -181,7 +181,7 @@ class TreatyCitationRef(Base):
     __tablename__ = "treaty_citation_refs"
     citation_ref_id = Column(Integer, primary_key=True)
     treaty_id = Column(Integer, ForeignKey('treaties.treaty_id'), nullable=False, index=True)
-    citation = Column(String(128), nullable=False)
+    citation = Column(Text, nullable=False)
 
 def create_all_tables():
     # Enable vital extensions (in superuser context if allowed)
@@ -218,6 +218,43 @@ def create_all_tables():
         """
         ALTER TABLE public.legislation
         ADD COLUMN IF NOT EXISTS subjurisdiction VARCHAR(32)
+        """,
+        # Widen columns to TEXT to avoid truncation (names/titles/citations can be long)
+        """
+        ALTER TABLE public.case_names
+        ALTER COLUMN name TYPE text
+        """,
+        """
+        ALTER TABLE public.case_citation_refs
+        ALTER COLUMN citation TYPE text
+        """,
+        """
+        ALTER TABLE public.legislation
+        ALTER COLUMN name TYPE text
+        """,
+        """
+        ALTER TABLE public.legislation_sections
+        ALTER COLUMN title TYPE text
+        """,
+        """
+        ALTER TABLE public.journals
+        ALTER COLUMN title TYPE text
+        """,
+        """
+        ALTER TABLE public.journal_authors
+        ALTER COLUMN name TYPE text
+        """,
+        """
+        ALTER TABLE public.journal_citation_refs
+        ALTER COLUMN citation TYPE text
+        """,
+        """
+        ALTER TABLE public.treaties
+        ALTER COLUMN title TYPE text
+        """,
+        """
+        ALTER TABLE public.treaty_citation_refs
+        ALTER COLUMN citation TYPE text
         """,
     ]
 

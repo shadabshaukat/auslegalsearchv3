@@ -533,6 +533,11 @@ def run_loader(root: Optional[str], partition_file: Optional[str], log_dir: str)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
+                # Ensure the session is usable for the next file after any failure
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
                 err += 1
                 print(f"[relational_loader] error: {fp} :: {e}")
 
