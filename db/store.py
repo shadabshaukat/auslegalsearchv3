@@ -284,8 +284,8 @@ def create_all_tables():
         ON public.embedding_session_files (status)
         """,
 
-        -- Relational model hardening: unique and partial unique indexes to enforce PK/FK usage safely
-        -- Avoid duplicate child rows under concurrency; keep loader idempotent at DB-level
+        # Relational model hardening: unique and partial unique indexes to enforce PK/FK usage safely
+        # Avoid duplicate child rows under concurrency; keep loader idempotent at DB-level
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_case_names_case_name
         ON public.case_names (case_id, name)
@@ -310,12 +310,12 @@ def create_all_tables():
         CREATE UNIQUE INDEX IF NOT EXISTS uq_treaty_citation_refs_treaty_cit
         ON public.treaty_citation_refs (treaty_id, citation)
         """,
-        -- Legislation sections: composite uniqueness (nulls are distinct; acceptable for our data)
+        # Legislation sections: composite uniqueness (nulls are distinct; acceptable for our data)
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_legislation_sections_comp
         ON public.legislation_sections (legislation_id, identifier, title)
         """,
-        -- Partial unique on URL when present to prevent duplicate master rows (optional safety)
+        # Partial unique on URL when present to prevent duplicate master rows (optional safety)
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_cases_url_notnull
         ON public.cases (url) WHERE url IS NOT NULL
