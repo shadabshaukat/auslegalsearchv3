@@ -74,9 +74,26 @@ Bulk delete — file with one URL per line:
   python -m tools.delete_url_records --url-file "/abs/path/urls.txt" --yes
   ```
 
-Show the SQL used and exit:
+Show the SQL used and exit (single and bulk)
+
+- Single URL (prints literal SQL with the provided URL substituted):
+```bash
+python -m tools.delete_url_records \
+  --url "https://austlii.edu.au/cgi-bin/viewdoc/au/cases/nsw/NSWCA/2011/428.html" \
+  --show-sql
+```
+
+- Bulk URLs (prints literal SQL for the first N URLs; cap controlled by AUSLEGALSEARCH_SHOWSQL_MAXURLS, default 20):
+```bash
+python -m tools.delete_url_records \
+  --url-file "/abs/path/urls.txt" \
+  --show-sql
+```
+
+- Template output (when no URL is provided, a parameterized :url template is printed):
 ```bash
 python -m tools.delete_url_records --show-sql
+# prints parameterized SQL with :url placeholders
 ```
 
 

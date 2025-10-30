@@ -155,6 +155,14 @@ def _read_urls_from_file(path: str) -> List[str]:
     return urls
 
 
+def _sql_quote(value: str) -> str:
+    """
+    Minimal SQL single-quote escaping for literal printing in --show-sql.
+    Do not use for parameter binding; engine uses parameters for real execution.
+    """
+    return (value or "").replace("'", "''")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Locate and delete records for a given URL (or a list of URLs) across embeddings and documents.")
     ap.add_argument("--url", required=False, help="URL value to match against embeddings.chunk_metadata->>'url'")
@@ -164,21 +172,7 @@ def main():
     ap.add_argument("--show-sql", action="store_true", help="Print the SQL statements for reference and exit")
     args = ap.parse_args()
 
-    if args.show_sql:
-        print("SQL to locate and delete by URL:")
-        print("\n-- Locate target doc_ids")
-        print(SQL_PREVIEW["doc_ids"].strip())
-        print("\n-- Count embeddings to be deleted")
-        print(SQL_PREVIEW["count_embeddings"].strip())
-        print("\n-- Count documents referencing those embeddings")
-        print(SQL_PREVIEW["count_documents"].strip())
-        print("\n-- Sample embeddings")
-        print(SQL_PREVIEW["sample_embeddings"].strip())
-        print("\n-- Delete embeddings (returning id, doc_id)")
-        print(SQL_DELETE_EMBEDDINGS.strip())
-        print("\n-- Delete documents for the deleted doc_ids (only if no embeddings remain)")
-        print(SQL_DELETE_DOCUMENTS.strip())
-        sys.exit(0)
+    # show-sql printing is handled after URL resolution so we can print literal SQL when URLs are provided
 
     # Resolve URL list (single or bulk)
     urls: List[str] = []
@@ -192,6 +186,46 @@ def main():
     else:
         print("[error] Either --url or --url-file must be provided.")
         sys.exit(2)
+
+    # --show-sql: if URLs are provided, print literal SQL per URL; otherwise print template with :url
+    if args.show_sql:
+        if urls:
+            max_urls = int(os.environ.get("AUSLEGALSEARCH_SHOWSQL_MAXURLS", "20"))
+            to_print = urls[:max_urls]
+            for u in to_print:
+                uq = _sql_quote(u)
+                print("SQL to locate and delete by URL (literal):")
+                print("\n-- Locate target doc_ids")
+                print(f"SELECT DISTINCT e.doc_id\n        FROM embeddings e\n        WHERE e.chunk_metadata->>'url' = '{uq}'")
+                print("\n-- Count embeddings to be deleted")
+                print(f"SELECT COUNT(*) AS emb_count\n        FROM embeddings e\n        WHERE e.chunk_metadata->>'url' = '{uq}'")
+                print("\n-- Count documents referencing those embeddings")
+                print("SELECT COUNT(*) AS doc_count\n        FROM documents d\n        WHERE EXISTS (\n            SELECT 1\n            FROM embeddings e\n            WHERE e.doc_id = d.id AND e.chunk_metadata->>'url' = '" + uq + "'\n        )")
+                print("\n-- Sample embeddings")
+                print(f"SELECT e.id, e.doc_id, e.chunk_index\n        FROM embeddings e\n        WHERE e.chunk_metadata->>'url' = '{uq}'\n        ORDER BY e.id\n        LIMIT 10")
+                print("\n-- Atomic delete (CTE; recommended)")
+                print("WITH del_emb AS (\n  DELETE FROM embeddings\n  WHERE chunk_metadata->>'url' = '" + uq + "'\n  RETURNING doc_id\n),\n del_docs AS (\n  DELETE FROM documents d\n  WHERE d.id IN (SELECT DISTINCT doc_id FROM del_emb)\n    AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id)\n  RETURNING d.id\n)\nSELECT\n  (SELECT COUNT(*) FROM del_emb)  AS embeddings_deleted,\n  (SELECT COUNT(*) FROM del_docs) AS documents_deleted;")
+                print("\n-- Two-step variant (transactional)")
+                print("BEGIN;\n\nCREATE TEMP TABLE _del_doc_ids AS\nSELECT DISTINCT doc_id\nFROM (\n  DELETE FROM embeddings\n  WHERE chunk_metadata->>'url' = '" + uq + "'\n  RETURNING doc_id\n) t;\n\nDELETE FROM documents d\nWHERE d.id IN (SELECT doc_id FROM _del_doc_ids)\n  AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.doc_id = d.id);\n\nCOMMIT;")
+                print("\n" + ("-" * 80) + "\n")
+            if len(urls) > max_urls:
+                print(f"-- Note: {len(urls)-max_urls} additional URL(s) omitted from --show-sql output.")
+        else:
+            # Template (no URL provided)
+            print("SQL to locate and delete by URL (template with :url):")
+            print("\n-- Locate target doc_ids")
+            print(SQL_PREVIEW["doc_ids"].strip())
+            print("\n-- Count embeddings to be deleted")
+            print(SQL_PREVIEW["count_embeddings"].strip())
+            print("\n-- Count documents referencing those embeddings")
+            print(SQL_PREVIEW["count_documents"].strip())
+            print("\n-- Sample embeddings")
+            print(SQL_PREVIEW["sample_embeddings"].strip())
+            print("\n-- Delete embeddings (returning id, doc_id)")
+            print(SQL_DELETE_EMBEDDINGS.strip())
+            print("\n-- Delete documents for the deleted doc_ids (only if no embeddings remain)")
+            print(SQL_DELETE_DOCUMENTS.strip())
+        sys.exit(0)
 
     if not urls:
         print("[info] No URL(s) to process.")
